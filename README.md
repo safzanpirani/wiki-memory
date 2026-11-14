@@ -35,6 +35,15 @@ wiki import --all             # compile the memory files into pages
 wiki verify                   # how much exact detail made it across
 ```
 
+If you have no memory files, start from your session history instead:
+
+```sh
+wiki bootstrap --dry-run      # which projects and how many sessions it would read; calls no model
+wiki bootstrap                # one model run per project writes its first pages, then asks three questions
+```
+
+`wiki bootstrap` reads the newest 15 sessions of each project from the last 30 days (`--days`, `--max-sessions`, `--project`), skips excluded directories, and creates the two pages every session loads: a user profile and a working-style page. You can also skip it: with only the hook installed, pages appear as agents save notes.
+
 Then schedule the unattended pass:
 
 ```sh
@@ -101,6 +110,20 @@ The memory files are never modified. `wiki import --refresh-all` re-imports the 
 - **Redaction.** Token-shaped strings (API keys, GitHub tokens, private key blocks) are replaced with `[REDACTED-SECRET]` in notes before they are written, in the copies a model reads, in run logs, and in every file before it is committed.
 - **Excluded projects.** Directories listed in `~/.config/wiki-memory/exclude.txt`, one per line, are never imported or dreamt over.
 - **Undo.** The wiki is a git repo. Each pass is one commit, and `wiki history <slug>`, `wiki diff <ref>` and `wiki undo <ref>` work on it.
+
+## How much automation
+
+Nothing reads your session transcripts unless you run `wiki dream` or `wiki bootstrap` yourself, and nothing is scheduled until you run `wiki install schedule`. Three common setups:
+
+| Setup | What to do |
+|---|---|
+| No model at all | Install the hook only. Agents save with `wiki note --page <slug>`, which appends to a page without a model. |
+| Fold only | `wiki config set WIKI_NIGHTLY fold`, then `wiki install schedule`. A nightly run files the inbox notes and does nothing else. |
+| Full | The default `WIKI_NIGHTLY=sync,refresh,fold`. Add `dream` to the list to also read each day's sessions. |
+
+`wiki config` prints every setting, its value and whether it comes from the environment, the settings file or the default. `wiki config set KEY VALUE` writes the settings file. `WIKI_IMPORT_MODEL`, `WIKI_FOLD_MODEL` and `WIKI_DREAM_MODEL` pick a model per kind of pass.
+
+`wiki install claude-code` (and `omp`, `codex`) also writes a short marked block into that agent's global instructions file (`~/.claude/CLAUDE.md`, `~/.omp/agent/AGENTS.md`, `~/.codex/AGENTS.md`). The hook loads the memory at session start; the block tells the agent when to search and when to save for the rest of the session. `--no-instructions` skips it and `--remove` takes it out again, leaving your own text as it was.
 
 ## Sharing between machines
 

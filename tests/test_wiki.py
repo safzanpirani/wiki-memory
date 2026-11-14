@@ -688,6 +688,89 @@ class Public(Base):
         self.assertEqual([(x["step"], x["rc"]) for x in res["steps"]], [("import --refresh-all", 0), ("fold", 0)])
         self.assertEqual(self.j("notes", "--all"), [])
 
+    def test_bootstrap_config_instructions(self):
+        home = self.tmp / "fresh"
+        env = dict(self.env, HOME=str(home), WIKI_HOME=str(home / "wiki"), WIKI_STATE=str(home / "state"),
+                   WIKI_PROJECTS=str(home / ".claude/projects"), WIKI_CONFIG=str(home / "config"),
+                   WIKI_OMP_SESSIONS=str(home / "none"), FAKE_OMP_BOOTSTRAP="1", WIKI_EXCLUDE=str(home / "exclude.txt"))
+        for k in ("WIKI_GLOBAL_DIRS", "WIKI_UMBRELLA"):
+            env.pop(k)
+
+        def w(*args, ok=(0,), **extra):
+            r = subprocess.run([sys.executable, str(WIKI_PY), *args], env={**env, **extra}, capture_output=True, text=True)
+            self.assertIn(r.returncode, ok, r.stdout + r.stderr)
+            return r
+
+        w("init")
+        # no memory files: import says so and points at bootstrap
+        self.assertIn("wiki bootstrap --dry-run", w("import", "--all").stdout)
+        self.assertIn("No sessions found", w("bootstrap", "--dry-run").stdout)
+        # two projects with sessions, one of them excluded
+        shop, secret = "/srv/wm-test/shop", "/srv/wm-test/secret"  # temp dirs count as smoke sessions and are skipped
+        (home / "exclude.txt").write_text(secret + "\n")
+        for cwd, n in ((shop, 3), (secret, 1)):
+            d = home / ".claude/projects" / slug(cwd)
+            d.mkdir(parents=True)
+            for i in range(n):
+                lines = [json.dumps({"type": "user", "cwd": cwd, "message": {"role": "user", "content": f"deploy talk {i} " * 200}})]
+                (d / f"s{i}.jsonl").write_text("\n".join(lines) + "\n")
+        plan = json.loads(w("bootstrap", "--dry-run", "--json").stdout)["plan"]
+        self.assertEqual([(Path(b["cwd"]).name, b["sessions"]) for b in plan], [("shop", 3)])
+        res = json.loads(w("bootstrap", "--max-sessions", "2", "--json").stdout)
+        self.assertEqual(res["seeded"], ["user-profile", "feedback-working-style"])
+        self.assertEqual([(Path(r["cwd"]).name, r["ok"]) for r in res["runs"]], [("shop", True)])
+        hub = (home / "wiki/pages/hub-shop.md").read_text()
+        self.assertIn("Hub from 2 sessions.", hub)  # the cap held, and only shop's sessions were offered
+        self.assertNotIn("secret", hub)
+        ctx = w("context", "--cwd", shop).stdout
+        self.assertIn("Nothing is recorded yet", ctx)  # the seed user page loads until facts replace it
+        self.assertEqual(json.loads(w("bootstrap", "--json").stdout)["seeded"], [])
+
+        # config: the file is read, the environment wins, unknown keys are refused
+        w("config", "set", "WIKI_NIGHTLY", "fold")
+        w("config", "set", "WIKI_FOLD_MODEL", "small")
+        w("config", "set", "WIKI_NOPE", "x", ok=(2,))
+        rows = {r["key"]: r for r in json.loads(w("config", "--json").stdout)["settings"]}
+        self.assertEqual((rows["WIKI_NIGHTLY"]["value"], rows["WIKI_NIGHTLY"]["source"]), ("fold", "env file"))
+        self.assertEqual(rows["WIKI_HOME"]["source"], "environment")
+        self.assertEqual(rows["WIKI_MAX_TIME"]["source"], "default")
+        self.assertEqual(oct((home / "config/env").stat().st_mode & 0o777), "0o600")
+        steps = json.loads(w("nightly", "--json").stdout)["steps"]
+        self.assertEqual([x["step"] for x in steps], ["fold"])  # no refresh, no dream, no sync
+        self.assertEqual(json.loads(w("nightly", "--json", WIKI_NIGHTLY="").stdout)["steps"], [])
+        w("nightly", ok=(2,), WIKI_NIGHTLY="fold,sleep")
+        got = subprocess.run([sys.executable, "-c", f"import sys, json; sys.path.insert(0, {str(CODE)!r}); import wiki; "
+                              "from pathlib import Path; print(json.dumps([wiki.PASS_MODEL, wiki.runner_command('p', Path('/w'), '5m', "
+                              "wiki.PASS_MODEL['fold'])[-3:]]))"], env=dict(env, WIKI_RUNNER="claude", WIKI_MODEL="big"),
+                             capture_output=True, text=True)
+        models, tail = json.loads(got.stdout)
+        self.assertEqual(models, {"import": "big", "fold": "small", "dream": "big"})
+        self.assertEqual(tail[-2:], ["--model", "small"])
+        w("config", "unset", "WIKI_NIGHTLY")
+        self.assertEqual({r["key"]: r for r in json.loads(w("config", "--json").stdout)["settings"]}["WIKI_NIGHTLY"]["source"],
+                         "default")
+
+        # instruction blocks: written once, replaced in place, removed without touching the user's own text
+        md = home / ".claude/CLAUDE.md"
+        md.write_text("# My rules\n\nBe brief.\n")
+        w("install", "claude-code", "codex")
+        w("install", "claude-code")
+        text = md.read_text()
+        self.assertTrue(text.startswith("# My rules\n\nBe brief.\n"))
+        self.assertEqual(text.count("wiki-memory:begin"), 1)
+        self.assertIn("wiki note --type", text)
+        codex = (home / ".codex/AGENTS.md").read_text()
+        self.assertIn("At the start of every session", codex)
+        self.assertNotIn("At the start of every session", text)  # Claude Code has the hook for that
+        doc = {c["check"]: c["detail"] for c in json.loads(w("doctor", "--json", ok=(0, 1)).stdout)["checks"]}
+        self.assertEqual(doc["instructions"], "claude-code, codex")
+        self.assertIn("none under", doc["memory files"])
+        w("install", "claude-code", "codex", "--remove")
+        self.assertEqual(md.read_text(), "# My rules\n\nBe brief.\n")
+        self.assertEqual((home / ".codex/AGENTS.md").read_text(), "")
+        w("install", "omp", "--no-instructions")
+        self.assertFalse((home / ".omp/agent/AGENTS.md").exists())
+
     def test_runner_commands(self):
         code = ("from pathlib import Path\n"
                 "print(json.dumps(wiki.runner_command('PROMPT', Path('/w'), '5m')))")

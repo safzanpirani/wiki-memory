@@ -99,5 +99,11 @@ elif "wiki \"dream\"" in prompt:
     report_json = re.search(r"JSON twin at `([^`]+)`", prompt).group(1)
     Path(report).write_text("# Dream\n\nNothing durable.\n")
     Path(report_json).write_text(json.dumps({"summary": {"sessionsRead": 0}}))
-    page("dream-note", "Dream note", "topic", "global", [], "From the dream. [[user-profile]]")
+    listed = re.findall(r"^### (\S+)$", prompt, re.M)  # the projects in the manifest
+    if os.environ.get("FAKE_OMP_BOOTSTRAP"):
+        for cwd_ in listed:
+            sessions = re.findall(r"`([^`]+\.jsonl)`", prompt)
+            page("hub-" + Path(cwd_).name, Path(cwd_).name, "project", [cwd_], sessions, f"Hub from {len(sessions)} sessions.")
+    else:
+        page("dream-note", "Dream note", "topic", "global", [], "From the dream. [[user-profile]]")
 print("fake omp done")

@@ -26,7 +26,9 @@ Model passes (a headless agent run in a sandbox; one at a time):
 
 Setup:
   wiki init                                    create the data repo
-  wiki install bin|claude-code|omp|schedule [--remove] [--at HH:MM]
+  wiki install bin|claude-code|omp|codex|schedule [--remove] [--no-instructions] [--at HH:MM]
+  wiki config [set KEY VALUE | unset KEY]      settings, their values and where each comes from
+  wiki bootstrap [--dry-run] [--days N] [--project CWD]   (model) first pages from session history
 
 Settings are WIKI_* environment variables, or the same lines in ~/.config/wiki-memory/env:
 WIKI_HOME, WIKI_STATE, WIKI_PROJECTS, WIKI_RUNNER (claude, codex, omp), WIKI_RUNNER_CMD, WIKI_MODEL,
@@ -72,6 +74,9 @@ CODE = Path(__file__).resolve().parent
 CONFIG = _path("WIKI_CONFIG", HOME / ".config/wiki-memory")
 
 
+FROM_FILE: set[str] = set()  # WIKI_* keys whose value came from the env file
+
+
 def _load_env_file() -> None:
     """`~/.config/wiki-memory/env`: WIKI_* settings, one KEY=VALUE per line. The real environment wins."""
     try:
@@ -84,7 +89,9 @@ def _load_env_file() -> None:
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
                 value = value[1:-1]  # one matching pair of outer quotes
-            os.environ.setdefault(key.strip(), value)
+            if key.strip() not in os.environ:
+                os.environ[key.strip()] = value
+                FROM_FILE.add(key.strip())
 
 
 _load_env_file()
@@ -106,6 +113,10 @@ RUNNER_CMD = shlex.split(os.environ.get("WIKI_RUNNER_CMD", ""))
 RUNNER = os.environ.get("WIKI_RUNNER") or ("custom" if RUNNER_CMD else
                                            next((r for r in RUNNER_BINS if shutil.which(r)), ""))
 MODEL = os.environ.get("WIKI_MODEL", "")  # empty: the runner's own default
+# One model per kind of pass; each falls back to WIKI_MODEL.
+PASS_MODEL = {k: os.environ.get(f"WIKI_{k.upper()}_MODEL") or MODEL for k in ("import", "fold", "dream")}
+NIGHTLY_STEPS = ("sync", "refresh", "dream", "fold")  # the order they run in; a second sync closes the pass
+NIGHTLY = [x.strip() for x in os.environ.get("WIKI_NIGHTLY", "sync,refresh,fold").split(",") if x.strip()]
 THINKING = os.environ.get("WIKI_THINKING", "high")  # omp only
 MAX_TIME = os.environ.get("WIKI_MAX_TIME", "50m")
 DREAM_MAX_TIME = os.environ.get("WIKI_DREAM_MAX_TIME", "60m")
@@ -1514,9 +1525,10 @@ def seconds(spec: str) -> int:
     return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
 
 
-def runner_command(prompt: str, cwd: Path, max_time: str) -> list[str]:
+def runner_command(prompt: str, cwd: Path, max_time: str, model_name: Optional[str] = None) -> list[str]:
     """The headless agent command for one model run; it must be free to edit files under cwd."""
-    model = ["--model", MODEL] if MODEL else []
+    model_name = MODEL if model_name is None else model_name
+    model = ["--model", model_name] if model_name else []
     if RUNNER == "claude":
         return ["claude", "-p", prompt, "--dangerously-skip-permissions", *model]
     if RUNNER == "codex":
@@ -1527,19 +1539,23 @@ def runner_command(prompt: str, cwd: Path, max_time: str) -> list[str]:
                 "--approval-mode", "yolo", "--session-dir", str(STATE / "sessions"), "--cwd", str(cwd),
                 "--max-time", max_time, prompt]
     if RUNNER == "custom" and RUNNER_CMD:
-        return [a.replace("{prompt}", prompt).replace("{cwd}", str(cwd)).replace("{model}", MODEL) for a in RUNNER_CMD]
+        return [a.replace("{prompt}", prompt).replace("{cwd}", str(cwd)).replace("{model}", model_name) for a in RUNNER_CMD]
     raise Usage("no model runner: install Claude Code, Codex or omp, or set WIKI_RUNNER=claude|codex|omp, or "
                 "WIKI_RUNNER_CMD to a command with {prompt}, {cwd} and {model}")
 
 
+def run_label(kind: str) -> str:
+    return RUNNER + (f"/{PASS_MODEL[kind]}" if PASS_MODEL[kind] else "")
+
+
 def run_model(prompt: str, cwd: Path, log_file: Path, max_time: str, extra: list[Path] = (),
-              stoppable: bool = False) -> tuple[Optional[int], float]:
+              stoppable: bool = False, kind: str = "import") -> tuple[Optional[int], float]:
     """Run the model runner to completion; (exit code, seconds). A stoppable run checks LIMIT under
     START right before spawning and returns (None, 0) without starting when a provider limit came in.
     A run past max_time is stopped and counts as failed (exit 124)."""
     limit = seconds(max_time)  # a bad value fails here, before anything starts
     cmd = (["caffeinate", "-i"] if shutil.which("caffeinate") else []) + sandbox_prefix() + \
-        runner_command(prompt, cwd, max_time)
+        runner_command(prompt, cwd, max_time, PASS_MODEL[kind])
     log_file.parent.mkdir(parents=True, exist_ok=True)
     (STATE / "sessions").mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -1734,7 +1750,7 @@ def run_import_batch(batch: dict, n: int, total: int, retry: bool = True) -> Opt
                 f"{len(batch['files'])} memory files, {batch['chars'] // 1024} KB, "
                 f"projects: {', '.join(p['hub'] for p in batch['projects'])}",
                 *([f"dropped from the stored plan (now excluded, gated or gone): {len(dropped)}"] if dropped else []),
-                f"runner {RUN_LABEL}, {secs / 60:.1f} min, exit {rc}, log {log_file}",
+                f"runner {run_label('import')}, {secs / 60:.1f} min, exit {rc}, log {log_file}",
                 *result_lines(res),
                 f"uncovered after batch: {len(uncovered) - len(noted)} (+{len(noted)} waiting in inbox notes)",
                 *([f"check: {len(unchecked & set(batch['files']))} of the batch's files uncovered in its copy"]
@@ -1799,7 +1815,7 @@ def run_merge_pass(name: str, inbox_files: list[str], lint_findings: str) -> Opt
                     INBOX="\n".join(f"- `wiki/inbox/{n}`" for n in inbox_files) or "- none",
                     LINT=lint_findings or "- none", CHECK=f"{SELF} _check {work}")
     log_file = STATE / "logs" / f"import-{name}.log"
-    rc, secs = run_model(prompt, work, log_file, MAX_TIME, stoppable=True)
+    rc, secs = run_model(prompt, work, log_file, MAX_TIME, stoppable=True, kind="fold")
     if rc is None:
         shutil.rmtree(work, ignore_errors=True)
         return None
@@ -1810,7 +1826,7 @@ def run_merge_pass(name: str, inbox_files: list[str], lint_findings: str) -> Opt
         status = "" if rc == 0 else f" (partial, exit {rc})"
         sha_ = None
         if not (limited and not any(res.values())):
-            append_log("import", name + status, [f"{len(inbox_files)} inbox notes given; runner {RUN_LABEL}, "
+            append_log("import", name + status, [f"{len(inbox_files)} inbox notes given; runner {run_label('fold')}, "
                                                  f"{secs / 60:.1f} min, exit {rc}, log {log_file}",
                                                  *result_lines(res)])
             sha_ = commit(f"import {name}{status}")
@@ -2249,6 +2265,11 @@ def cmd_import(args) -> int:
     if not (args.all or args.project or args.gaps or args.refresh or args.refresh_project or args.refresh_all):
         raise Usage("pass --all, --project CWD, --gaps, --refresh PATH..., --refresh-project CWD, --refresh-all, "
                     "--mark-ingested or --report")
+    if not source_projects_cache() and not args.refresh:
+        out(args, {"plan": [], "failed": [], "coverage": None, "memoryFiles": 0},
+            f"no memory files under {PROJECTS}: nothing to import. Without memory files, start from your session "
+            "history with `wiki bootstrap --dry-run`, or just use `wiki note`.")
+        return 0
     if args.dry_run:  # reads only and saves nothing, so it takes no lock
         projects = source_projects_cache()
         plan, states, dropped = plan_states(select_plan(args, projects, save=False), projects)
@@ -2352,11 +2373,11 @@ def recent_sessions(since: float, dirs: tuple[str, ...]) -> list[dict]:
     return sorted(found, key=lambda s: (s["cwd"], s["mtime"]))
 
 
-def dream_manifest(since: float) -> tuple[str, list[dict]]:
+def dream_manifest(since: float, sessions: Optional[list[dict]] = None) -> tuple[str, list[dict]]:
     dirs = excluded_dirs()
-    sessions = recent_sessions(since, dirs)
+    sessions = recent_sessions(since, dirs) if sessions is None else sessions
     pages = load_pages()
-    parts = [f"omp and Claude Code sessions written since {datetime.fromtimestamp(since):%Y-%m-%d %H:%M} "
+    parts = [f"Agent sessions written since {datetime.fromtimestamp(since):%Y-%m-%d %H:%M} "
              f"({len(sessions)} top-level; /tmp smoke sessions excluded):"]
     cwd = None
     for s in sessions:
@@ -2635,6 +2656,44 @@ def install_claude(remove: bool) -> str:
     return f"Claude Code: SessionStart hook {'removed from' if remove else 'added to'} {f} (new sessions pick it up)"
 
 
+BLOCK = ("<!-- wiki-memory:begin (managed by `wiki install`; edits here are overwritten) -->",
+         "<!-- wiki-memory:end -->")
+GLOBAL_FILES = {"claude-code": HOME / ".claude/CLAUDE.md", "omp": HOME / ".omp/agent/AGENTS.md",
+                "codex": HOME / ".codex/AGENTS.md"}
+
+
+def install_instructions(target: str, remove: bool) -> str:
+    """A marked block in the agent's global instructions file: when to recall, when and how to save.
+    The session hook loads the memory itself; this keeps the habit alive deep into a long session and
+    in subagents the hook does not reach. Codex has no session hook, so its block also loads the memory."""
+    f = GLOBAL_FILES[target]
+    text = f.read_text() if f.exists() else ""
+    start, end = text.find(BLOCK[0]), text.find(BLOCK[1])
+    has = 0 <= start < end
+    rest = (text[:start].rstrip("\n") + "\n" + text[end + len(BLOCK[1]):].lstrip("\n")) if has else text
+    if remove:
+        if not has:
+            return f"{f}: no wiki-memory block"
+        new = rest.strip("\n") + "\n" if rest.strip() else ""
+    else:
+        body = (CODE / "prompts/global.md").read_text().strip()
+        if target == "codex":
+            body += ("\n- **At the start of every session** run `wiki context --instructions` and treat its output as "
+                     "your memory for this project.")
+        new = (rest.rstrip("\n") + "\n\n" if rest.strip() else "") + f"{BLOCK[0]}\n{body}\n{BLOCK[1]}\n"
+    if new == text:
+        return f"{f}: instructions already current"
+    if f.exists():
+        shutil.copy2(f, f.with_name(f"{f.name}.bak-wiki-memory-{datetime.now():%Y%m%d-%H%M%S}"))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+    tmp.write_text(new)
+    if f.exists():
+        os.chmod(tmp, f.stat().st_mode & 0o777)
+    tmp.replace(f)
+    return f"{f}: wiki-memory instructions {'removed' if remove else 'written'}"
+
+
 def install_omp(remove: bool) -> str:
     f = HOME / ".omp/agent/extensions/wiki-memory.ts"
     if remove:
@@ -2751,11 +2810,78 @@ def install_schedule(remove: bool, at: str) -> str:
 
 
 def cmd_install(args) -> int:
-    """Wire the CLI into this machine: the `wiki` command, an agent's session-start hook, the nightly job."""
-    todo = {"bin": lambda: install_bin(args.remove), "claude-code": lambda: install_claude(args.remove),
-            "omp": lambda: install_omp(args.remove), "schedule": lambda: install_schedule(args.remove, args.at)}
-    lines = [todo[t]() for t in args.targets]
+    """Wire the CLI into this machine: the `wiki` command, an agent's session-start hook and its global
+    instructions, the nightly job."""
+    hooks = {"claude-code": install_claude, "omp": install_omp}
+    lines = []
+    for t in args.targets:
+        if t == "bin":
+            lines.append(install_bin(args.remove))
+        elif t == "schedule":
+            lines.append(install_schedule(args.remove, args.at))
+        else:
+            if t in hooks:
+                lines.append(hooks[t](args.remove))
+            if args.remove or not args.no_instructions:
+                lines.append(install_instructions(t, args.remove))
     out(args, {"done": lines}, "\n".join(lines))
+    return 0
+
+
+SETTINGS = (
+    ("WIKI_HOME", "~/.local/share/wiki-memory/wiki", "the data repo: pages, inbox, index, log"),
+    ("WIKI_STATE", "~/.local/share/wiki-memory/state", "lock, logs, scratch copies, the import ledger"),
+    ("WIKI_PROJECTS", "~/.claude/projects", "where Claude Code memory folders and sessions live"),
+    ("WIKI_RUNNER", "first of claude, codex, omp on PATH", "the headless agent that does model passes"),
+    ("WIKI_RUNNER_CMD", "", "a custom runner command with {prompt}, {cwd} and {model}"),
+    ("WIKI_MODEL", "the runner's default", "model for every pass"),
+    ("WIKI_IMPORT_MODEL", "WIKI_MODEL", "model for import and refresh"),
+    ("WIKI_FOLD_MODEL", "WIKI_MODEL", "model for fold and merge passes"),
+    ("WIKI_DREAM_MODEL", "WIKI_MODEL", "model for dream and bootstrap"),
+    ("WIKI_NIGHTLY", "sync,refresh,fold", "steps of the nightly pass: any of sync, refresh, dream, fold; empty for none"),
+    ("WIKI_NOTES_ONLY", "", "1: this machine never runs a model pass"),
+    ("WIKI_SANDBOX", "1", "0: run model passes without a sandbox"),
+    ("WIKI_EXCLUDE", "~/.config/wiki-memory/exclude.txt", "project directories never read, one per line"),
+    ("WIKI_GLOBAL_DIRS", "", "folders whose memory is about everything; imported first"),
+    ("WIKI_UMBRELLA", "", "parent folders that hold many repos"),
+    ("WIKI_BATCH_CHARS", "220000", "size of one import batch"),
+    ("WIKI_MAX_TIME", "50m", "time limit of one import or fold run"),
+    ("WIKI_DREAM_MAX_TIME", "60m", "time limit of one dream or bootstrap run"),
+)
+
+
+def cmd_config(args) -> int:
+    """Show every setting with its value and where it comes from, or write one to the env file."""
+    env_file = CONFIG / "env"
+    known = {k for k, _, _ in SETTINGS}
+    if args.action in ("set", "unset"):
+        if args.key not in known:
+            raise Usage(f"unknown setting {args.key}; `wiki config` lists them")
+        if args.action == "set" and (args.value is None or re.search(r"[\x00-\x1f\x7f]", args.value)):
+            raise Usage("config set KEY VALUE: one line, no control characters")
+        lines = env_file.read_text().splitlines() if env_file.exists() else []
+        lines = [line for line in lines if line.strip().partition("=")[0].strip() != args.key]
+        if args.action == "set":
+            lines.append(f"{args.key}={args.value}")
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = env_file.with_name(f".env.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines) + ("\n" if lines else ""))
+        tmp.replace(env_file)
+        shadow = args.key in os.environ and args.key not in FROM_FILE
+        out(args, {"file": str(env_file), "key": args.key, "value": args.value if args.action == "set" else None},
+            f"{'set' if args.action == 'set' else 'unset'} {args.key} in {env_file}"
+            + ("; the environment variable of the same name still wins in this shell" if shadow else "")
+            + ("; re-run `wiki install schedule` so the nightly job gets it" if schedule_active() else ""))
+        return 0
+    rows = [{"key": k, "value": os.environ.get(k), "default": d, "help": h,
+             "source": "env file" if k in FROM_FILE else "environment" if k in os.environ else "default"}
+            for k, d, h in SETTINGS]
+    text = [f"settings file: {env_file}" + ("" if env_file.exists() else " (not created yet)")]
+    text += [f"  {r['key']:<20} {(r['value'] if r['value'] is not None else r['default'] or '(unset)'):<38} "
+             f"{r['source']:<12} {r['help']}" for r in rows]
+    out(args, {"file": str(env_file), "settings": rows}, "\n".join(text))
     return 0
 
 
@@ -2763,10 +2889,15 @@ def cmd_nightly(args) -> int:
     """The unattended pass: sync, re-import changed memory files, fold notes, sync. One line per step;
     a step that is busy, limited or failing never stops the next."""
     ensure_repo()
-    remote = bool(git("remote", check=False).stdout.split())
-    steps = [["sync"]] if remote else []
-    if os.environ.get("WIKI_NOTES_ONLY") != "1":
-        steps += [["import", "--refresh-all"], ["fold"]] + ([["sync"]] if remote else [])
+    bad = [x for x in NIGHTLY if x not in NIGHTLY_STEPS]
+    if bad:
+        raise Usage(f"WIKI_NIGHTLY has unknown steps: {', '.join(bad)} (choose from {', '.join(NIGHTLY_STEPS)})")
+    remote = bool(git("remote", check=False).stdout.split()) and "sync" in NIGHTLY
+    models = os.environ.get("WIKI_NOTES_ONLY") != "1"
+    commands = {"refresh": ["import", "--refresh-all"], "dream": ["dream"], "fold": ["fold"]}
+    steps = ([["sync"]] if remote else []) + [commands[x] for x in NIGHTLY_STEPS if x in commands and x in NIGHTLY and models]
+    if remote and len(steps) > 1:
+        steps.append(["sync"])
     worst, done = 0, []
     for step in steps:
         r = subprocess.run([sys.executable, str(CODE / "wiki.py"), *step], capture_output=True, text=True,
@@ -2803,6 +2934,12 @@ def cmd_doctor(args) -> int:
     check("sandbox", True if notes_only else (None if off else bool(box)),
           "off (WIKI_SANDBOX=0): model runs are unprotected" if off else (box or "none found"),
           "install bubblewrap" if sys.platform != "darwin" else "")
+    files = sum(len(p["files"]) + len(p["gated"]) for p in source_projects()) if have else 0
+    covered = coverage()["pct"] if have and files else None
+    check("memory files", True if files else None,
+          f"{files} under {PROJECTS}, {covered}% listed on pages" if files else f"none under {PROJECTS}",
+          "wiki import --all --dry-run" if files and covered != 100 else
+          "" if files else "wiki bootstrap --dry-run   (pages from your session history), or just use `wiki note`")
     link = shutil.which("wiki")
     check("wiki on PATH", bool(link) or None, link or "not on PATH; hooks call the script by its full path",
           "wiki.py install bin")
@@ -2813,7 +2950,11 @@ def cmd_doctor(args) -> int:
     hooks = [n for n, on in (("Claude Code", bool(claude_hooks(settings))),
                              ("omp", (HOME / ".omp/agent/extensions/wiki-memory.ts").exists())) if on]
     check("session hook", bool(hooks) or None, ", ".join(hooks) or "no agent loads the wiki yet",
-          "wiki install claude-code   (or: wiki install omp)")
+          "wiki install claude-code   (or: wiki install omp, wiki install codex)")
+    blocks = [t for t, f in GLOBAL_FILES.items() if f.exists() and BLOCK[0] in f.read_text(errors="replace")]
+    check("instructions", bool(blocks) or None, ", ".join(blocks) or "no global instructions file has the wiki block",
+          "wiki install claude-code   (writes the hook and the block)")
+    check("nightly steps", True, ", ".join(NIGHTLY) or "none")
     sched = schedule_active()
     check("nightly job", sched or None, "registered" if sched else "not scheduled; notes are folded only when you run `wiki fold`",
           "wiki install schedule")
@@ -2850,57 +2991,139 @@ def cmd_doctor(args) -> int:
     return 1 if any(c["ok"] is False for c in checks) else 0
 
 
+def dream_pass(since: float, name: str, sessions: Optional[list[dict]] = None, dry_run: bool = False) -> dict:
+    """One model run that reads the sessions in the manifest and updates pages. Takes the lock itself."""
+    day = today()
+    reports = STATE / "reports"
+    report, report_json = reports / f"{name}.md", reports / f"{name}.json"
+    manifest, sessions = dream_manifest(since, sessions)
+    work = STATE / "work" / name
+    values = dict(DATE=day, WORK=str(work), REPORT=str(report), REPORT_JSON=str(report_json), TRANSCRIPT=f"{SELF} transcript",
+                  SCHEMA=schema_text(), MANIFEST=manifest, CHECK=f"{SELF} _check {work}")
+    if dry_run:
+        return {"date": day, "sessions": len(sessions), "report": str(report), "prompt": render("dream.md", **values)}
+    with Lock():
+        init_repo()
+        reports.mkdir(parents=True, exist_ok=True)
+        snap = commit(f"snapshot before {name}")
+        with INTEGRATE:
+            work, base = prepare_work(name)
+        rc, secs = run_model(render("dream.md", **values), work, STATE / "logs" / f"{name}.log", DREAM_MAX_TIME,
+                             [report, report_json], kind="dream")
+        check_limit(rc, STATE / "logs" / f"{name}.log")
+        res = integrate(work, base, name)
+        ok = rc == 0 and report.exists()
+        append_log("dream", name + ("" if ok else f" (exit {rc}{', no report' if not report.exists() else ''})"),
+                   [f"{len(sessions)} sessions in manifest since {datetime.fromtimestamp(since):%Y-%m-%d %H:%M}",
+                    f"runner {run_label('dream')}, {secs / 60:.1f} min, report {report}", *result_lines(res)])
+        new = commit(f"dream {name}")
+        record_run({"kind": "dream", "batch": name, "rc": rc, "seconds": round(secs), "commit": new,
+                    "date": datetime.now().isoformat(timespec="seconds")})
+        if rc == 0:
+            shutil.rmtree(work, ignore_errors=True)
+    return {"date": day, "name": name, "ok": ok, "exit": rc, "minutes": round(secs / 60, 1), "sessions": len(sessions),
+            "snapshot": snap, "commit": new, "report": str(report) if report.exists() else None,
+            "changes": {k: v for k, v in res.items() if v}, "added": len(res["added"]), "updated": len(res["updated"]),
+            "conflicts": len(res["conflicts"])}
+
+
 def cmd_dream(args) -> int:
     if not args.dry_run:
         model_host_check()
     since = time.time() - args.since_hours * 3600
-    day = today()
-    reports = STATE / "reports"
-    report, report_json = reports / f"dream-{day}.md", reports / f"dream-{day}.json"
-    if report.exists():
-        stamp = datetime.now().strftime("%H%M")
-        report, report_json = reports / f"dream-{day}-{stamp}.md", reports / f"dream-{day}-{stamp}.json"
-    manifest, sessions = dream_manifest(since)
-    work_name = f"dream-{datetime.now():%Y%m%d-%H%M}"
-    work = STATE / "work" / work_name
-    values = dict(DATE=day, WORK=str(work), REPORT=str(report), REPORT_JSON=str(report_json), TRANSCRIPT=f"{SELF} transcript",
-                  SCHEMA=schema_text(), MANIFEST=manifest, CHECK=f"{SELF} _check {work}")
+    data = dream_pass(since, f"dream-{datetime.now():%Y%m%d-%H%M%S}", dry_run=args.dry_run)
     if args.dry_run:
-        prompt = render("dream.md", **values)
-        out(args, {"date": day, "sessions": len(sessions), "report": str(report), "prompt": prompt}, prompt)
+        out(args, data, data["prompt"])
         return 0
-    try:
-        lock = Lock().__enter__()
-    except Locked:
-        out(args, {"error": "locked"}, "another import/dream/undo holds the lock")
-        return 4
-    try:
-        init_repo()
-        reports.mkdir(parents=True, exist_ok=True)
-        snap = commit(f"snapshot before dream {day}")
-        with INTEGRATE:
-            work, base = prepare_work(work_name)
-        rc, secs = run_model(render("dream.md", **values), work, STATE / "logs" / f"{work_name}.log", DREAM_MAX_TIME,
-                             [report, report_json])
-        res = integrate(work, base, work_name)
-        ok = rc == 0 and report.exists()
-        append_log("dream", day + ("" if ok else f" (exit {rc}{', no report' if not report.exists() else ''})"),
-                   [f"{len(sessions)} sessions in manifest since {datetime.fromtimestamp(since):%Y-%m-%d %H:%M}",
-                    f"runner {RUN_LABEL}, {secs / 60:.1f} min, report {report}", *result_lines(res)])
-        new = commit(f"dream {day}")
-        record_run({"kind": "dream", "batch": work_name, "rc": rc, "seconds": round(secs), "commit": new,
-                    "date": datetime.now().isoformat(timespec="seconds")})
-        if rc == 0:
-            shutil.rmtree(work, ignore_errors=True)
-    finally:
-        lock.__exit__(None, None, None)
-    data = {"date": day, "ok": ok, "ompExit": rc, "minutes": round(secs / 60, 1), "sessions": len(sessions),
-            "snapshot": snap, "commit": new, "report": str(report) if report.exists() else None,
-            "changes": {k: v for k, v in res.items() if v}}
-    out(args, data, f"dream {day}: {'ok' if ok else 'FAILED'} ({secs / 60:.0f} min); +{len(res['added'])} pages, "
-                    f"~{len(res['updated'])} updated, {len(res['conflicts'])} conflicts; report {data['report']}; "
-                    f"undo: `wiki undo {new[:7]}`" if new else "no changes")
-    return 0 if ok else 1
+    new = data["commit"]
+    out(args, data, f"dream {data['date']}: {'ok' if data['ok'] else 'FAILED'} ({data['minutes']:.0f} min); "
+                    f"+{data['added']} pages, ~{data['updated']} updated, {data['conflicts']} conflicts; "
+                    f"report {data['report']}; undo: `wiki undo {new[:7]}`" if new else "no changes")
+    return 0 if data["ok"] else (5 if LIMIT.is_set() else 1)
+
+
+SEED_PAGES = {
+    "user-profile": ("User profile", "user", "Who the user is, how they work and what they prefer; loaded in every session.",
+                     "Nothing is recorded yet. Facts about the user go here: role, background, how they like to work."),
+    "feedback-working-style": ("Working style", "feedback", "Rules the user gave agents about how to work and reply; loaded in every session.",
+                               "No rules are recorded yet. Each rule is one bold line, followed by **Why:** and **How to apply:** lines."),
+}
+INTERVIEW = (("user", "About you", "What do you do, and what are you mostly working on?"),
+             ("feedback", "How to reply", "How should agents reply to you (length, tone, what comes first)?"),
+             ("feedback", "Standing rules", "Which rules do you keep repeating to agents? One per line, or leave empty."))
+
+
+def seed_pages() -> list[str]:
+    """The two pages every session loads, so the first user and feedback facts have a home."""
+    made = []
+    for slug, (title, kind, summary, body) in SEED_PAGES.items():
+        f = PAGES / f"{slug}.md"
+        if any(p.kind == kind for p in load_pages().values()) or f.exists():
+            continue
+        f.write_text(dump_frontmatter({"title": title, "summary": summary, "kind": kind, "scope": "global",
+                                       "tags": ["core"], "sources": [], "updated": today()}) + f"\n{body}\n")
+        made.append(slug)
+    return made
+
+
+def cmd_bootstrap(args) -> int:
+    """Start a wiki without memory files: read each project's recent agent sessions (one model run per
+    project) and write its first pages. Asks first with --dry-run; reads nothing under excluded dirs."""
+    ensure_repo()
+    since = time.time() - args.days * 86400
+    by_cwd: dict[str, list[dict]] = {}
+    for sess in recent_sessions(since, excluded_dirs()):
+        by_cwd.setdefault(sess["cwd"], []).append(sess)
+    if args.project:
+        want = resolve_cwd(args.project)
+        by_cwd = {c: v for c, v in by_cwd.items() if c == want}
+    plan = sorted(({"cwd": c, "sessions": sorted(v, key=lambda x: -x["mtime"])[:args.max_sessions], "found": len(v)}
+                   for c, v in by_cwd.items()), key=lambda b: -b["found"])[:args.max_projects]
+    kb = sum(x["kb"] for b in plan for x in b["sessions"])
+    head = (f"{len(plan)} projects with agent sessions in the last {args.days} days; "
+            f"{sum(len(b['sessions']) for b in plan)} sessions ({kb / 1024:.1f} MB of transcripts) would be read, "
+            f"one model run per project, newest {args.max_sessions} sessions each")
+    rows = [f"  {len(b['sessions']):>3} of {b['found']:<4} {b['cwd']}" for b in plan]
+    if args.dry_run or not plan:
+        hint = ("\nNo sessions found: start using the hook and `wiki note`; pages appear with the first `wiki fold`."
+                if not plan else "\nA run reads the dialogue only, in bounded slices, so it costs far less than the transcript "
+                "sizes suggest; there is no measured estimate yet. Run without --dry-run to start, or try one project "
+                "first with --project.")
+        out(args, {"plan": [{"cwd": b["cwd"], "sessions": len(b["sessions"]), "found": b["found"]} for b in plan],
+                   "transcriptKB": kb}, "\n".join([head, *rows]) + hint)
+        return 0
+    model_host_check()
+    with Lock():
+        seeded = seed_pages()
+        if seeded:
+            append_log("bootstrap", "seed pages", [f"created {', '.join(seeded)}"])
+            commit("bootstrap seed pages")
+    stamp, results = datetime.now().strftime("%Y%m%d-%H%M%S"), []
+    for n, b in enumerate(plan, 1):
+        if LIMIT.is_set():
+            break
+        slug = re.sub(r"[^a-z0-9]+", "-", Path(b["cwd"]).name.lower()).strip("-") or "project"
+        r = dream_pass(since, f"bootstrap-{stamp}-{n:02d}-{slug}", sessions=b["sessions"])
+        results.append({"cwd": b["cwd"], **{k: r[k] for k in ("ok", "exit", "minutes", "added", "updated", "commit")}})
+        print(f"[{datetime.now():%H:%M}] bootstrap {n}/{len(plan)} {b['cwd']}: {'ok' if r['ok'] else 'failed'}, "
+              f"{r['minutes']} min, +{r['added']} pages ~{r['updated']}", file=sys.stderr, flush=True)
+    asked = []
+    if sys.stdin.isatty() and not args.json and not args.no_questions:
+        print("\nThree questions, so the first sessions know you. Press Enter to skip one.")
+        for kind, title, question in INTERVIEW:
+            answer = input(f"{question}\n> ").strip()
+            if answer:
+                sub = argparse.Namespace(json=True, type=kind, title=title, body=answer, cwd=str(HOME), gated=None, page=None)
+                with contextlib.redirect_stdout(open(os.devnull, "w")):
+                    cmd_note(sub)
+                asked.append(title)
+    failed = [r["cwd"] for r in results if not r["ok"]]
+    out(args, {"seeded": seeded, "runs": results, "notes": asked, "limited": LIMIT.is_set()},
+        f"bootstrap: {len(results) - len(failed)} of {len(plan)} projects done, "
+        f"+{sum(r['added'] for r in results)} pages" + (f"; failed: {', '.join(failed)}" if failed else "")
+        + (f"; {limit_text()}" if LIMIT.is_set() else "")
+        + (f"; saved {len(asked)} notes (fold them with `wiki fold`)" if asked else ""))
+    return 5 if LIMIT.is_set() else (1 if failed else 0)
 
 
 # ---- main --------------------------------------------------------------------------------------
@@ -2973,9 +3196,22 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--from-event", type=int, default=0)
     verb("doctor", cmd_doctor, "check the install: runner, sandbox, hooks, schedule, sync")
     s = verb("install", cmd_install, "wire the CLI into this machine")
-    s.add_argument("targets", nargs="+", choices=("bin", "claude-code", "omp", "schedule"))
+    s.add_argument("targets", nargs="+", choices=("bin", "claude-code", "omp", "codex", "schedule"))
+    s.add_argument("--no-instructions", action="store_true",
+                   help="only the hook: leave the agent's global instructions file alone")
     s.add_argument("--remove", action="store_true")
     s.add_argument("--at", default="04:30", help="schedule: HH:MM local time (default 04:30)")
+    s = verb("config", cmd_config, "show settings, or write one to the env file")
+    s.add_argument("action", nargs="?", choices=("set", "unset"))
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?")
+    s = verb("bootstrap", cmd_bootstrap, "(model) first pages from your agent session history")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--days", type=int, default=30)
+    s.add_argument("--max-sessions", type=int, default=15, help="newest sessions read per project (default 15)")
+    s.add_argument("--max-projects", type=int, default=20)
+    s.add_argument("--project", metavar="CWD")
+    s.add_argument("--no-questions", action="store_true")
     verb("nightly", cmd_nightly, "(model) the unattended pass: sync, refresh, fold, sync")
     s = verb("note", cmd_note, "save a fact for later folding (no model)")
     s.add_argument("--title", required=True)
