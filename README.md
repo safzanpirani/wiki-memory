@@ -245,7 +245,7 @@ Every command takes `--json`. Exit codes: 0 ok, 1 failed, 2 usage, 3 lint issues
 python3 -m unittest discover -s tests
 ```
 
-The tests build a temporary home, wiki and memory tree and use `tests/fake_omp.py` in place of a model. They cover planning, parallel batches and merging, resume, the ledger, gating, redaction, the macOS sandbox, notes, folding, sync between two clones, the installers and the nightly pass.
+The tests build a temporary home, wiki and memory tree and use `tests/fake_omp.py` in place of a model. They cover planning, parallel batches and merging, resume, the ledger, gating, redaction, the macOS sandbox, notes, folding, sync between two clones, the graph page, the installers, each agent's hook format, the OpenCode and Pi adapters (when `node` and `bun` exist) and the nightly pass.
 
 ## License
 
