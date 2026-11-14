@@ -142,6 +142,19 @@ class WikiSmoke(Base):
         self.assertIn("alpha", self.j("backlinks", "alpha-db")["backlinks"])
         self.assertEqual(self.j("read", "alpha")[0]["slug"], "alpha")
 
+        # graph: the page data holds no gated page, and --anon holds no title, slug or summary
+        def graph(*flags):
+            path = self.j("graph", "-o", str(Path(self.env["WIKI_HOME"]).parent / "graph.html"), *flags)["path"]
+            return json.loads(Path(path).read_text().split("const D = ", 1)[1].split(";\n", 1)[0])
+        g = graph()
+        slugs = [n["s"] for n in g["nodes"]]
+        self.assertIn([slugs.index("alpha"), slugs.index("alpha-db")], g["links"])
+        self.assertFalse(any(s.startswith("gated-") for s in slugs))
+        anon = graph("--anon")
+        self.assertEqual(len(anon["nodes"]), len(slugs))
+        self.assertEqual({(n["t"], n["d"]) for n in anon["nodes"]}, {("", "")})
+        self.assertFalse(set(slugs) & {n["s"] for n in anon["nodes"]})
+
         # context: hub + core page bodies, inside budget, no gated body
         ctx = self.j("context", "--cwd", self.alpha, "--budget-chars", "3000")
         self.assertLessEqual(ctx["chars"], 3000)

@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wiki graph</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d12; --fg: #e6e8ee; --muted: #8b93a7; --line: 148, 163, 184; --panel: #12151ccc; --border: #232838;
+    --user: #f472b6; --feedback: #fbbf24; --machine: #34d399; --project: #60a5fa; --tool: #a78bfa; --topic: #7c869c;
+  }
+  :root.light {
+    color-scheme: light;
+    --bg: #fafafa; --fg: #16181d; --muted: #667085; --line: 71, 85, 105; --panel: #ffffffd9; --border: #e2e5ec;
+    --user: #db2777; --feedback: #d97706; --machine: #059669; --project: #2563eb; --tool: #7c3aed; --topic: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  canvas.over { cursor: pointer; }
+  .card { position: fixed; background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+  #head { top: 16px; left: 16px; padding: 12px 14px; width: 250px; }
+  #head h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+  #head p { margin: 2px 0 10px; color: var(--muted); font-size: 13px; }
+  #q { width: 100%; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--border); background: transparent;
+    color: inherit; font: inherit; outline: none; }
+  #q:focus { border-color: var(--muted); }
+  #legend { margin: 10px 0 0; padding: 0; list-style: none; }
+  #legend li { display: flex; align-items: center; gap: 8px; padding: 2px 0; cursor: pointer; user-select: none; }
+  #legend li.off { opacity: 0.35; }
+  #legend i { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  #legend span { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #side { top: 16px; right: 16px; bottom: 16px; width: 320px; padding: 16px; overflow-y: auto; display: none; }
+  #side h2 { margin: 0 0 2px; font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+  #side .meta { color: var(--muted); font-size: 13px; }
+  #side p { margin: 10px 0; }
+  #side code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
+  #side h3 { margin: 16px 0 4px; font-size: 13px; font-weight: 600; color: var(--muted); }
+  #side ul { margin: 0; padding: 0; list-style: none; }
+  #side li { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; cursor: pointer; overflow-wrap: anywhere; }
+  #side li:hover { text-decoration: underline; }
+  #side li i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  #hint { bottom: 16px; left: 16px; padding: 6px 10px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="head" class="card">
+  <h1 id="name"></h1>
+  <p id="stats"></p>
+  <input id="q" type="search" placeholder="Find a page" autocomplete="off" spellcheck="false">
+  <ul id="legend"></ul>
+</div>
+<div id="side" class="card"></div>
+<div id="hint" class="card">scroll to zoom · drag to pan · click a page · T switches theme</div>
+<script>
+const D = /*DATA*/;
+const KINDS = ["user", "feedback", "machine", "project", "tool", "topic"];
+const $ = (id) => document.getElementById(id);
+const canvas = $("c"), ctx = canvas.getContext("2d");
+const N = D.nodes.length, L = D.links;
+const nodes = D.nodes.map((n, i) => ({ ...n, i, out: [], in: [], x: 0, y: 0, fixed: false }));
+for (const [a, b] of L) { nodes[a].out.push(b); nodes[b].in.push(a); }
+for (const n of nodes) {
+  n.deg = n.in.length + n.out.length;
+  n.r = 2.4 + Math.sqrt(n.in.length) * 1.35;
+  n.near = new Set([...n.in, ...n.out]);
+  n.hay = (n.t + " " + n.s).toLowerCase();
+  const short = n.t.split(/ \(| [-–—] |: /)[0];  // "fleet (cross-machine exec)" is drawn as "fleet"
+  n.label = short.length > 30 ? short.slice(0, 29) + "…" : short;
+}
+
+// ---- layout: springs on links, repulsion between all pairs, a pull to the centre ----------------
+const X = new Float32Array(N), Y = new Float32Array(N), VX = new Float32Array(N), VY = new Float32Array(N);
+for (let i = 0; i < N; i++) {
+  const r = 14 * Math.sqrt(i + 0.5), a = i * 2.39996323;
+  X[i] = r * Math.cos(a); Y[i] = r * Math.sin(a);
+}
+let alpha = 1;
+function tick() {
+  for (const [a, b] of L) {
+    let dx = X[b] + VX[b] - X[a] - VX[a] || 1e-3, dy = Y[b] + VY[b] - Y[a] - VY[a] || 1e-3;
+    const d = Math.sqrt(dx * dx + dy * dy), da = nodes[a].deg, db = nodes[b].deg;
+    const f = (d - 62) / d * alpha / Math.min(da, db), bias = da / (da + db);
+    dx *= f; dy *= f;
+    VX[b] -= dx * bias; VY[b] -= dy * bias; VX[a] += dx * (1 - bias); VY[a] += dy * (1 - bias);
+  }
+  for (let i = 0; i < N; i++) {
+    const xi = X[i], yi = Y[i], ci = 44 + nodes[i].r * 7;
+    for (let j = i + 1; j < N; j++) {
+      const dx = xi - X[j] || 1e-3, dy = yi - Y[j] || 1e-3, d2 = dx * dx + dy * dy;
+      if (d2 > 250000) continue;
+      const f = alpha / Math.max(d2, 16), cj = 44 + nodes[j].r * 7;
+      VX[i] += dx * f * cj; VY[i] += dy * f * cj; VX[j] -= dx * f * ci; VY[j] -= dy * f * ci;
+    }
+  }
+  for (let i = 0; i < N; i++) {
+    if (nodes[i].fixed) { VX[i] = VY[i] = 0; continue; }
+    VX[i] = (VX[i] - X[i] * 0.04 * alpha) * 0.6; VY[i] = (VY[i] - Y[i] * 0.04 * alpha) * 0.6;
+    X[i] += VX[i]; Y[i] += VY[i];
+  }
+  alpha += (0 - alpha) * 0.0228;
+}
+for (let i = 0; i < 140 && N; i++) tick();
+
+// ---- view ----------------------------------------------------------------------------------------
+let W = 0, H = 0, dpr = 1, k = 1, tx = 0, ty = 0;
+let hover = null, picked = null, query = "", hits = null;
+const hidden = new Set();
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+let colors = {};
+function theme(light) {
+  document.documentElement.classList.toggle("light", light);
+  colors = Object.fromEntries(KINDS.map((x) => [x, css("--" + x)]));
+  colors.fg = css("--fg"); colors.bg = css("--bg"); colors.line = css("--line");
+  for (const li of $("legend").children) li.firstChild.style.background = colors[li.dataset.k];
+}
+function resize() {
+  dpr = window.devicePixelRatio || 1; W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+}
+function fit() {
+  if (!N) return;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (let i = 0; i < N; i++) {
+    x0 = Math.min(x0, X[i]); x1 = Math.max(x1, X[i]); y0 = Math.min(y0, Y[i]); y1 = Math.max(y1, Y[i]);
+  }
+  k = Math.min(W / (x1 - x0 + 80), H / (y1 - y0 + 80), 2.5);
+  tx = W / 2 - (x0 + x1) / 2 * k; ty = H / 2 - (y0 + y1) / 2 * k;
+}
+const shown = (n) => !hidden.has(n.k);
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const focus = [picked, hover].find((n) => n && shown(n)) || null;
+  const lit = (n) => focus ? n === focus || focus.near.has(n.i) : hits ? hits.has(n.i) : true;
+  ctx.lineWidth = Math.min(1, 0.5 + k * 0.25);
+  ctx.strokeStyle = `rgba(${colors.line}, ${focus || hits ? 0.06 : 0.2})`;
+  ctx.beginPath();
+  for (const [a, b] of L) {
+    if (!shown(nodes[a]) || !shown(nodes[b])) continue;
+    ctx.moveTo(X[a] * k + tx, Y[a] * k + ty); ctx.lineTo(X[b] * k + tx, Y[b] * k + ty);
+  }
+  ctx.stroke();
+  if (focus) {
+    ctx.strokeStyle = colors[focus.k] || colors.fg; ctx.globalAlpha = 0.75; ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    for (const j of focus.near) {
+      if (!shown(nodes[j])) continue;
+      ctx.moveTo(X[focus.i] * k + tx, Y[focus.i] * k + ty); ctx.lineTo(X[j] * k + tx, Y[j] * k + ty);
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  const rs = Math.max(0.55, Math.min(1.6, Math.sqrt(k)));
+  const labels = [];
+  for (const n of nodes) {
+    if (!shown(n)) continue;
+    const x = X[n.i] * k + tx, y = Y[n.i] * k + ty, r = n.r * rs;
+    if (x < -40 || y < -40 || x > W + 40 || y > H + 40) continue;
+    const on = lit(n);
+    ctx.globalAlpha = on ? 1 : 0.13;
+    ctx.fillStyle = colors[n.k] || colors.topic;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill();
+    if (n === focus) { ctx.strokeStyle = colors.fg; ctx.lineWidth = 1.5; ctx.stroke(); }
+    if (n.t && on && (focus || hits || r * k > 5.2)) labels.push([n, x, y, r]);
+  }
+  ctx.globalAlpha = 1;
+  // Biggest pages claim their label first; a label that would overlap a placed one is dropped.
+  labels.sort((a, b) => (b[0] === focus) - (a[0] === focus) || b[0].in.length - a[0].in.length);
+  ctx.font = "12px ui-sans-serif, system-ui, -apple-system, sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.lineJoin = "round";
+  const placed = [];
+  for (const [n, x, y, r] of labels) {
+    if (placed.length > 220) break;
+    const text = n.label, w = ctx.measureText(text).width / 2 + 3;
+    const box = [x - w, y + r + 2, x + w, y + r + 17];
+    if (placed.some((p) => box[0] < p[2] && box[2] > p[0] && box[1] < p[3] && box[3] > p[1])) continue;
+    placed.push(box);
+    ctx.strokeStyle = colors.bg; ctx.lineWidth = 3; ctx.strokeText(text, x, y + r + 3);
+    ctx.fillStyle = colors.fg; ctx.fillText(text, x, y + r + 3);
+  }
+}
+let queued = false;
+function frame() {
+  queued = false;
+  if (alpha > 0.004) { tick(); schedule(); }
+  draw();
+}
+function schedule() { if (!queued) { queued = true; requestAnimationFrame(frame); } }
+
+// ---- side panel ----------------------------------------------------------------------------------
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function list(title, ids) {
+  if (!ids.length) return "";
+  const rows = ids.map((j) => nodes[j]).sort((a, b) => b.in.length - a.in.length)
+    .map((n) => `<li data-i="${n.i}"><i style="background:${colors[n.k] || colors.topic}"></i>${esc(n.t || n.k)}</li>`);
+  return `<h3>${title} (${ids.length})</h3><ul>${rows.join("")}</ul>`;
+}
+function pick(n, centre) {
+  picked = n;
+  const side = $("side");
+  side.style.display = n ? "block" : "none";
+  if (n) {
+    side.innerHTML = `<h2>${esc(n.t || n.k + " page")}</h2>`
+      + `<div class="meta">${esc(n.k)}${n.u ? " · updated " + esc(n.u) : ""}</div>`
+      + (n.d ? `<p>${esc(n.d)}</p>` : "") + (D.anon ? "" : `<code>wiki read ${esc(n.s)}</code>`)
+      + list("Links to", n.out) + list("Linked from", n.in);
+    side.scrollTop = 0;
+    if (centre) { k = Math.max(k, 1.1); tx = (W - 340) / 2 - X[n.i] * k; ty = H / 2 - Y[n.i] * k; }
+  }
+  schedule();
+}
+$("side").addEventListener("click", (e) => {
+  const li = e.target.closest("li[data-i]");
+  if (li) pick(nodes[+li.dataset.i], true);
+});
+
+// ---- input ---------------------------------------------------------------------------------------
+function at(px, py) {
+  const rs = Math.max(0.55, Math.min(1.6, Math.sqrt(k)));
+  let best = null, bd = Infinity;
+  for (const n of nodes) {
+    if (!shown(n)) continue;
+    const dx = X[n.i] * k + tx - px, dy = Y[n.i] * k + ty - py, d = dx * dx + dy * dy, r = n.r * rs + 4;
+    if (d < r * r && d < bd) { best = n; bd = d; }
+  }
+  return best;
+}
+let drag = null;
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  drag = { n: at(e.clientX, e.clientY), x: e.clientX, y: e.clientY, moved: false };
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!drag) {
+    const n = at(e.clientX, e.clientY);
+    if (n !== hover) { hover = n; canvas.classList.toggle("over", !!n); schedule(); }
+    return;
+  }
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (!drag.moved && dx * dx + dy * dy < 9) return;
+  drag.moved = true; drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.n) {
+    const i = drag.n.i;
+    drag.n.fixed = true; X[i] += dx / k; Y[i] += dy / k; alpha = Math.max(alpha, 0.12);
+  } else { tx += dx; ty += dy; }
+  schedule();
+});
+canvas.addEventListener("pointerup", () => {
+  if (drag && drag.n) drag.n.fixed = false;
+  if (drag && !drag.moved) pick(drag.n, false);
+  drag = null;
+});
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const z = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015)), nk = Math.max(0.08, Math.min(8, k * z));
+  tx = e.clientX - (e.clientX - tx) * nk / k; ty = e.clientY - (e.clientY - ty) * nk / k; k = nk;
+  schedule();
+}, { passive: false });
+$("q").addEventListener("input", (e) => {
+  query = e.target.value.trim().toLowerCase();
+  hits = query ? new Set(nodes.filter((n) => n.hay.includes(query)).map((n) => n.i)) : null;
+  hover = null; pick(null);
+});
+$("q").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || !hits || !hits.size) return;
+  pick([...hits].map((i) => nodes[i]).sort((a, b) => b.in.length - a.in.length)[0], true);
+});
+addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { $("q").value = ""; hits = null; pick(null); }
+  else if (e.target === $("q")) return;
+  else if (e.key === "t" || e.key === "T") { theme(!document.documentElement.classList.contains("light")); schedule(); }
+  else if (e.key === "f" || e.key === "F") { fit(); schedule(); }
+  else if (e.key === "/") { e.preventDefault(); $("q").focus(); }
+});
+addEventListener("resize", () => { resize(); schedule(); });
+
+// ---- chrome --------------------------------------------------------------------------------------
+$("name").textContent = D.name;
+document.title = D.name + " graph";
+$("stats").textContent = `${N.toLocaleString()} pages · ${L.length.toLocaleString()} links`;
+if (D.anon) $("q").style.display = "none";
+for (const kind of KINDS) {
+  const count = nodes.filter((n) => n.k === kind).length;
+  if (!count) continue;
+  const li = document.createElement("li");
+  li.dataset.k = kind;
+  li.innerHTML = `<i></i>${kind}<span>${count}</span>`;
+  li.addEventListener("click", () => {
+    hidden.has(kind) ? hidden.delete(kind) : hidden.add(kind);
+    li.classList.toggle("off", hidden.has(kind)); schedule();
+  });
+  $("legend").appendChild(li);
+}
+theme(new URLSearchParams(location.search).get("theme") === "light");
+resize(); fit(); schedule();
+</script>
+</body>
+</html>

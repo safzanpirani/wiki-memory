@@ -73,6 +73,17 @@ Start a new agent session in any project. It now opens with that project's memor
 
 During the session the agent looks things up with `wiki search <terms>` and `wiki read <slug>`.
 
+## Seeing the wiki
+
+```sh
+wiki graph --open          # every page a dot, every [[link]] a line
+wiki graph --anon -o g.html  # kinds and shape only, for a screenshot you can post
+```
+
+`wiki graph` writes one HTML file with no dependencies and no network requests. A dot's colour is the page's kind and its size is the number of pages that link to it. Click a page to see its summary, the pages it links to and the pages that link to it. The search box finds a page by title or slug, and the legend hides a kind. Gated pages are never in the file. `--cwd PATH` keeps the global pages and one project's pages.
+
+![The link graph of a wiki with 700 pages, drawn by wiki graph --anon](docs/graph.png)
+
 ## Saving a fact
 
 ```sh
@@ -183,6 +194,7 @@ Every command takes `--json`. Exit codes: 0 ok, 1 failed, 2 usage, 3 lint issues
 | Command | Model | Does |
 |---|---|---|
 | `context`, `index`, `search`, `read`, `backlinks`, `log` | no | read the wiki |
+| `graph [-o FILE] [--cwd PATH] [--anon] [--open]` | no | one HTML page that draws the pages and their links |
 | `note`, `notes` | no | save a fact; list notes not folded yet |
 | `status`, `doctor`, `lint [--fix]`, `verify` | no | state, install check, page checks, import fidelity |
 | `history`, `diff`, `undo` | no | git history per page; revert a pass |

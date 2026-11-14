@@ -6,6 +6,7 @@ Read (no model):
   wiki search <terms>... [--cwd PATH] [--gated]   ranked literal search (gated pages only with --gated)
   wiki read <slug>...  |  wiki index [--cwd PATH]  |  wiki backlinks <slug>  |  wiki log [-n N]
   wiki status  |  wiki doctor  |  wiki lint [--fix]  |  wiki verify [--project CWD]
+  wiki graph [-o FILE] [--cwd PATH] [--anon] [--open]   the pages and their links as one HTML page
 
 Write (no model):
   wiki note --type user|feedback|project|reference --title T [--body TEXT] [--cwd PATH]
@@ -2047,6 +2048,31 @@ def cmd_backlinks(args) -> int:
     return 0
 
 
+def cmd_graph(args) -> int:
+    """One self-contained HTML page: every page a dot, every [[link]] a line. Gated pages are left out."""
+    ensure_repo()
+    cwd = resolve_cwd(args.cwd)
+    pages = [p for p in load_pages().values() if not p.gated and in_scope(p, cwd)]
+    at = {p.slug: i for i, p in enumerate(pages)}
+    links = sorted({(at[p.slug], at[t]) for p in pages for t in p.links() if t in at and t != p.slug})
+    if args.anon:  # safe to post: kinds and shape only, no titles, slugs, summaries or dates
+        nodes = [{"s": f"p{i}", "t": "", "k": p.kind, "d": "", "u": ""} for i, p in enumerate(pages)]
+    else:
+        nodes = [{"s": p.slug, "t": p.title, "k": p.kind, "d": p.summary, "u": str(p.meta.get("updated") or "")}
+                 for p in pages]
+    data = {"name": args.title, "anon": args.anon, "nodes": nodes, "links": links}
+    path = Path(os.path.expanduser(args.output)).resolve() if args.output else STATE / "graph.html"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+    path.write_text((CODE / "graph.html").read_text().replace("/*DATA*/", blob, 1))
+    if args.open:
+        import webbrowser
+        webbrowser.open(path.as_uri())
+    out(args, {"path": str(path), "pages": len(nodes), "links": len(links), "anon": args.anon},
+        f"{len(nodes)} pages, {len(links)} links: {path}")
+    return 0
+
+
 def cmd_log(args) -> int:
     ensure_repo()
     entries, cur = [], None
@@ -3190,6 +3216,12 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--gated", action="store_true")
     s.add_argument("-n", type=int, default=15)
     verb("backlinks", cmd_backlinks, "pages linking to a page").add_argument("slug")
+    s = verb("graph", cmd_graph, "the pages and their links as one HTML page")
+    s.add_argument("-o", "--output", help="file to write (default: graph.html in the state folder)")
+    s.add_argument("--cwd", help="only global pages and this project's")
+    s.add_argument("--anon", action="store_true", help="no titles, slugs or summaries: safe to post")
+    s.add_argument("--title", default="wiki-memory", help="name shown on the page")
+    s.add_argument("--open", action="store_true", help="open the page in the browser")
     verb("log", cmd_log, "recent log entries").add_argument("-n", type=int, default=10)
     verb("lint", cmd_lint, "check the wiki").add_argument("--fix", action="store_true")
     s = verb("history", cmd_history, "commits touching a page")
