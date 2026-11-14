@@ -677,6 +677,79 @@ class Public(Base):
         self.wiki("install", "claude-code", ok=(2,))
         self.assertEqual(settings.read_text(), "{not json")
         settings.write_text("{}")
+
+        # the other agents: hooks go in beside existing ones, answer in each agent's format, and come out again
+        droid, agy = self.home / ".factory/settings.json", self.home / ".gemini/config/hooks.json"
+        for f, body in ((droid, {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "other start"}]}],
+                                           "Stop": [1]}}), (agy, {"other": {"PreInvocation": []}})):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(body))
+        agents = ("droid", "codex", "agy", "opencode", "pi", "skill")
+        self.wiki("install", *agents)
+        self.wiki("install", *agents)
+        cmds = [h["command"] for e in json.loads(droid.read_text())["hooks"]["SessionStart"] for h in e["hooks"]]
+        self.assertEqual((len(cmds), cmds[0]), (2, "other start"))
+        self.assertTrue(cmds[1].endswith("hook droid"))
+        self.assertEqual(len(json.loads((self.home / ".codex/hooks.json").read_text())["hooks"]["SessionStart"]), 1)
+        self.assertIn("Droid, OpenCode, Pi, Antigravity", {c["check"]: c for c in self.j("doctor")["checks"]}["session hook"]["detail"])
+        self.assertIn("name: wiki-memory", (self.home / ".agents/skills/wiki-memory/SKILL.md").read_text())
+
+        def hook(fmt, stdin, **env):
+            r = subprocess.run([sys.executable, str(WIKI_PY), "hook", fmt], input=json.dumps(stdin), env={**self.env, **env},
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+        got = json.loads(hook("droid", {"cwd": self.beta}))
+        self.assertEqual((got["suppressOutput"], got["hookSpecificOutput"]["hookEventName"]), (True, "SessionStart"))
+        self.assertIn("wiki note --type", got["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("[[beta]]", got["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("suppressOutput", json.loads(hook("codex", {"cwd": self.beta})))
+        # Antigravity runs the hook before every model call: one message per conversation
+        log = self.tmp / "agy.jsonl"
+        first = json.loads(hook("agy", {"workspacePaths": [self.beta], "transcriptPath": str(log)}))["injectSteps"][0]["userMessage"]
+        self.assertIn("[[beta]]", first)
+        log.write_text(json.dumps({"type": "USER_INPUT", "content": first}, separators=(",", ":")) + "\n")
+        self.assertEqual(hook("agy", {"workspacePaths": [self.beta], "transcriptPath": str(log)}).strip(), "{}")
+        # a broken wiki never blocks a session
+        self.assertEqual((hook("text", {}, WIKI_HOME=str(self.tmp / "nowhere")), hook("agy", {}, WIKI_HOME=str(self.tmp / "nowhere")).strip()),
+                         ("", "{}"))
+        if shutil.which("node"):  # OpenCode 1: first message, not again, not a subagent session, again after compaction
+            js = self.tmp / "oc.mjs"
+            js.write_text(f"""import {{ WikiMemoryPlugin }} from "{self.home}/.config/opencode/plugins/wiki-memory.js";
+const p = await WikiMemoryPlugin({{ directory: "{self.beta}" }});
+const send = async (id) => {{ const o = {{ parts: [{{ type: "text", text: "hi" }}] }}; await p["chat.message"]({{ sessionID: id }}, o); return o.parts[0].text; }};
+await p.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "child", parentID: "s1" }} }} }} }});
+const r = [await send("s1"), await send("s1"), await send("child")];
+await p.event({{ event: {{ type: "session.compacted", properties: {{ sessionID: "s1" }} }} }});
+r.push(await send("s1"));
+console.log(JSON.stringify(r.map((t) => t.includes("[[beta]]"))));
+""")
+            r = subprocess.run(["node", str(js)], env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(), "[true,false,false,true]", r.stderr)
+        if shutil.which("bun"):  # Pi: first turn, not again, again after compaction, not after an extension reload
+            ts = self.tmp / "pi.ts"
+            ts.write_text(f"""import ext from "{self.home}/.pi/agent/extensions/wiki-memory.ts";
+const h: Record<string, Function> = {{}};
+ext({{ on: (e: string, f: Function) => (h[e] = f) }} as never);
+const turn = async () => Boolean((await h.before_agent_start({{}}, {{ cwd: "{self.beta}" }}))?.message?.content?.includes("[[beta]]"));
+const r: boolean[] = [];
+await h.session_start({{ reason: "startup" }}); r.push(await turn(), await turn());
+await h.session_compact({{}}); r.push(await turn());
+await h.session_start({{ reason: "reload" }}); r.push(await turn());
+console.log(JSON.stringify(r));
+""")
+            r = subprocess.run(["bun", str(ts)], env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(), "[true,false,true,false]", r.stderr)
+        plan = self.j("install", "--dry-run")["targets"]
+        self.assertEqual((plan[0], plan[-1]), ("bin", "skill"))
+        self.wiki("install", "--remove")
+        left = json.loads(droid.read_text())["hooks"]
+        self.assertEqual(([h["command"] for e in left["SessionStart"] for h in e["hooks"]], left["Stop"]), (["other start"], [1]))
+        self.assertEqual(json.loads(agy.read_text()), {"other": {"PreInvocation": []}})
+        self.assertNotIn("SessionStart", json.loads((self.home / ".codex/hooks.json").read_text())["hooks"])
+        for gone in (".config/opencode/plugins/wiki-memory.js", ".pi/agent/extensions/wiki-memory.ts", ".agents/skills/wiki-memory"):
+            self.assertFalse((self.home / gone).exists(), gone)
+        self.wiki("install", "nope", ok=(2,))
         # someone else's `wiki` is never replaced
         other = self.home / ".local/bin/wiki"
         other.parent.mkdir(parents=True, exist_ok=True)
@@ -784,8 +857,8 @@ class Public(Base):
         self.assertEqual(text.count("wiki-memory:begin"), 1)
         self.assertIn("wiki note --type", text)
         codex = (home / ".codex/AGENTS.md").read_text()
-        self.assertIn("At the start of every session", codex)
-        self.assertNotIn("At the start of every session", text)  # Claude Code has the hook for that
+        self.assertIn("did not open with the wiki memory block", codex)
+        self.assertNotIn("did not open with the wiki memory block", text)  # Claude Code's hook always runs
         doc = {c["check"]: c["detail"] for c in json.loads(w("doctor", "--json", ok=(0, 1)).stdout)["checks"]}
         self.assertEqual(doc["instructions"], "claude-code, codex")
         self.assertIn("none under", doc["memory files"])

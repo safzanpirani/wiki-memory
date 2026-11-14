@@ -27,7 +27,9 @@ Model passes (a headless agent run in a sandbox; one at a time):
 
 Setup:
   wiki init                                    create the data repo
-  wiki install bin|claude-code|omp|codex|schedule [--remove] [--no-instructions] [--at HH:MM]
+  wiki install [bin|claude-code|codex|droid|opencode|pi|omp|agy|skill|schedule ...] [--remove] [--dry-run]
+               [--no-instructions] [--at HH:MM]   no target: bin, every agent found here and the skill
+  wiki hook droid|codex|agy|text               the memory block in one agent's hook format (hooks run it)
   wiki config [set KEY VALUE | unset KEY]      settings, their values and where each comes from
   wiki bootstrap [--dry-run] [--days N] [--project CWD]   (model) first pages from session history
 
@@ -1988,6 +1990,44 @@ def cmd_context(args) -> int:
     return 0
 
 
+def cmd_hook(args) -> int:
+    """What an agent's session-start hook runs: the memory block for the project named in the hook input
+    on stdin, in the shape that agent reads. It never fails: on any problem it prints nothing (agy: {})
+    and exits 0, so a broken wiki cannot block a session."""
+    try:
+        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+        data = data if isinstance(data, dict) else {}
+        paths = data.get("workspacePaths")
+        cwd = data.get("cwd") or (paths[0] if isinstance(paths, list) and paths else None)
+        if not (isinstance(cwd, str) and os.path.isdir(cwd)):
+            cwd = os.getcwd()
+        text = ""
+        # Antigravity runs its hook before every model call. The injected message stays in the
+        # conversation, so add it only when the transcript does not hold one yet.
+        seen = False
+        transcript = data.get("transcriptPath")
+        if args.format == "agy" and isinstance(transcript, str) and os.path.isfile(transcript):
+            with open(transcript, errors="replace") as fh:
+                seen = any('"type":"USER_INPUT"' in line and MEMORY_MARK in line for line in fh)
+        if not seen:
+            ensure_repo()
+            text = ((CODE / "prompts/agent.md").read_text().rstrip() + "\n\n"
+                    + context_with_notes(resolve_cwd(cwd), 16000)["text"]).rstrip()
+    except Exception:  # noqa: BLE001 - a hook must never break the session it runs in
+        text = ""
+    if args.format == "text":
+        print(text, end="\n" if text else "")
+    elif args.format == "agy":
+        print(json.dumps({"injectSteps": [{"userMessage": text}]} if text else {}))
+    elif text:
+        reply = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+        if args.format == "droid":
+            reply["suppressOutput"] = True
+        print(json.dumps(reply))
+    return 0
+
+
 def cmd_read(args) -> int:
     ensure_repo()
     pages = load_pages()
@@ -2623,15 +2663,59 @@ def cmd_verify(args) -> int:
 
 
 HOOK_MARK = "context --cwd"
+HOOK_FORMATS = ("droid", "codex", "agy", "text")
+MEMORY_MARK = "Your persistent memory is a wiki of topic pages"  # opens prompts/agent.md; the agy hook looks for it
 LAUNCHD_LABEL, SYSTEMD_UNIT = "dev.wiki-memory.nightly", "wiki-memory-nightly"
 
 
-def hook_command() -> str:
-    return f'{shlex.quote(sys.executable)} {shlex.quote(str(CODE / "wiki.py"))} {HOOK_MARK} "$CLAUDE_PROJECT_DIR" --instructions'
+def hook_command(fmt: str = "") -> str:
+    """The shell command a harness runs at session start. Claude Code prints the block as plain text;
+    the others get `wiki hook <format>`, which reads the hook input and answers in that harness's JSON."""
+    base = f'{shlex.quote(sys.executable)} {shlex.quote(str(CODE / "wiki.py"))}'
+    return f"{base} hook {fmt}" if fmt else f'{base} {HOOK_MARK} "$CLAUDE_PROJECT_DIR" --instructions'
 
 
 def is_wiki_hook(h: dict) -> bool:
-    return "wiki.py" in str(h.get("command")) and HOOK_MARK in str(h.get("command"))
+    c = str(h.get("command"))
+    return "wiki.py" in c and (HOOK_MARK in c or " hook " in c)
+
+
+def without_wiki_hooks(entries: list) -> list:
+    """A hook event's entries minus this CLI's commands; a neighbour sharing an entry stays."""
+    kept = []
+    for e in entries:
+        if isinstance(e, dict) and isinstance(e.get("hooks"), list):
+            rest = [h for h in e["hooks"] if not (isinstance(h, dict) and is_wiki_hook(h))]
+            if not rest:
+                continue
+            e = {**e, "hooks": rest} if len(rest) != len(e["hooks"]) else e
+        kept.append(e)
+    return kept
+
+
+def load_config(f: Path) -> dict:
+    try:
+        data = json.loads(f.read_text()) if f.exists() else {}
+    except ValueError as e:
+        raise Usage(f"{f} is not valid JSON ({e}); fix it first, nothing was changed")
+    if not isinstance(data, dict):
+        raise Usage(f"{f} has an unexpected shape (not a JSON object); nothing was changed")
+    return data
+
+
+def write_config(f: Path, data: dict) -> None:
+    """Replace a JSON config in one step, keeping its mode; the old file stays beside it as a dated backup."""
+    f = Path(os.path.realpath(f))  # a config symlinked from a dotfiles repo stays a symlink
+    mode = f.stat().st_mode & 0o777 if f.exists() else 0o600
+    if f.exists():
+        shutil.copy2(f, f.with_name(f"{f.name}.bak-wiki-memory-{datetime.now():%Y%m%d-%H%M%S}"))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(data, indent=2) + "\n")
+    os.chmod(tmp, mode)
+    tmp.replace(f)
 
 
 def claude_hooks(settings: dict) -> list[dict]:
@@ -2644,42 +2728,84 @@ def claude_hooks(settings: dict) -> list[dict]:
 
 def install_claude(remove: bool) -> str:
     f = HOME / ".claude/settings.json"
-    try:
-        settings = json.loads(f.read_text()) if f.exists() else {}
-    except ValueError as e:
-        raise Usage(f"{f} is not valid JSON ({e}); fix it first, nothing was changed")
-    if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict) \
-            or not isinstance(settings.get("hooks", {}).get("SessionStart", []), list):
+    settings = load_config(f)
+    if not isinstance(settings.get("hooks", {}), dict) or not isinstance(settings.get("hooks", {}).get("SessionStart", []), list):
         raise Usage(f"{f} has an unexpected shape (hooks.SessionStart is not a list); nothing was changed")
     mine = claude_hooks(settings)
     if remove:
         if not mine:
             return "Claude Code: no wiki hook installed"
-        kept = []
-        for e in settings["hooks"]["SessionStart"]:  # only this CLI's command goes; its neighbours stay
-            if isinstance(e, dict) and isinstance(e.get("hooks"), list):
-                rest = [h for h in e["hooks"] if not (isinstance(h, dict) and is_wiki_hook(h))]
-                if not rest:
-                    continue
-                e = {**e, "hooks": rest}
-            kept.append(e)
-        settings["hooks"]["SessionStart"] = kept
+        settings["hooks"]["SessionStart"] = without_wiki_hooks(settings["hooks"]["SessionStart"])
     elif mine:
         return f"Claude Code: hook already in {f}"
     else:
         settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(
             {"hooks": [{"type": "command", "command": hook_command()}]})
-    mode = f.stat().st_mode & 0o777 if f.exists() else 0o600
-    if f.exists():
-        shutil.copy2(f, f.with_name(f"settings.json.bak-wiki-memory-{datetime.now():%Y%m%d-%H%M%S}"))
-    f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_name(f".settings.json.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(json.dumps(settings, indent=2) + "\n")
-    os.chmod(tmp, mode)
-    tmp.replace(f)
+    write_config(f, settings)
     return f"Claude Code: SessionStart hook {'removed from' if remove else 'added to'} {f} (new sessions pick it up)"
+
+
+def session_hook_file(target: str) -> tuple[Path, bool]:
+    """Where Droid or Codex keeps SessionStart hooks, and whether the events sit under a "hooks" key.
+    Droid reads hooks.json when that file exists, otherwise settings.json."""
+    if target == "droid" and (HOME / ".factory/hooks.json").exists():
+        return HOME / ".factory/hooks.json", False
+    return (HOME / ".factory/settings.json" if target == "droid" else HOME / ".codex/hooks.json"), True
+
+
+def session_hooks(target: str) -> tuple[Path, dict, dict]:
+    """(file, parsed config, the dict inside it that maps event names to hook entries)."""
+    f, nested = session_hook_file(target)
+    data = load_config(f)
+    events = data.get("hooks", {}) if nested else data
+    if not isinstance(events, dict) or not isinstance(events.get("SessionStart", []), list):
+        raise Usage(f"{f} has an unexpected shape (SessionStart is not a list); nothing was changed")
+    if nested:
+        data["hooks"] = events
+    return f, data, events
+
+
+def install_session_hook(target: str, remove: bool) -> str:
+    """Droid and Codex: one SessionStart hook that runs `wiki hook <target>`. Other hooks stay."""
+    name = HARNESSES[target][0]
+    f, data, events = session_hooks(target)
+    old = events.get("SessionStart", [])
+    new = without_wiki_hooks(old)
+    if not remove:
+        new.append({"hooks": [{"type": "command", "command": hook_command(target), "timeout": 10}]})
+    if new == old:
+        return f"{name}: {'no wiki hook installed' if remove else f'hook already in {f}'}"
+    if new:
+        events["SessionStart"] = new
+    else:
+        del events["SessionStart"]
+    write_config(f, data)
+    notes = ""
+    if target == "codex" and not remove:
+        toml = HOME / ".codex/config.toml"
+        if not (toml.exists() and re.search(r"(?m)^\s*hooks\s*=\s*true", toml.read_text(errors="replace"))):
+            notes += f"\n  note: add `hooks = true` under [features] in {toml} if Codex does not run hooks"
+        notes += "\n  note: Codex asks you to trust the new hook the next time it starts"
+    return f"{name}: SessionStart hook {'removed from' if remove else 'added to'} {f} (new sessions pick it up){notes}"
+
+
+AGY_KEY = "wiki-memory"
+
+
+def install_agy(remove: bool) -> str:
+    """Antigravity has no session-start event. Its hooks.json maps a name to events, so this owns the
+    "wiki-memory" name: a PreInvocation hook that `wiki hook agy` answers once per conversation."""
+    f = HOME / ".gemini/config/hooks.json"
+    data = load_config(f)
+    new = None if remove else {"PreInvocation": [{"type": "command", "command": hook_command("agy"), "timeout": 10}]}
+    if data.get(AGY_KEY) == new:
+        return f"Antigravity: {'no wiki hook installed' if remove else f'hook already in {f}'}"
+    if new:
+        data[AGY_KEY] = new
+    else:
+        del data[AGY_KEY]
+    write_config(f, data)
+    return f"Antigravity: PreInvocation hook {'removed from' if remove else 'added to'} {f}"
 
 
 BLOCK = ("<!-- wiki-memory:begin (managed by `wiki install`; edits here are overwritten) -->",
@@ -2719,8 +2845,9 @@ def install_instructions(target: str, remove: bool) -> str:
     else:
         body = (CODE / "prompts/global.md").read_text().strip()
         if target == "codex":
-            body += ("\n- **At the start of every session** run `wiki context --instructions` and treat its output as "
-                     "your memory for this project.")
+            body += ("\n- **If a session did not open with the wiki memory block** (a `# Memory` section that names "
+                     "the `wiki` command), run `wiki context --instructions` first and treat its output as your "
+                     "memory for this project.")
         nl = "\r\n" if "\r\n" in text else "\n"
         block = f"{BLOCK[0]}\n{body}\n{BLOCK[1]}\n".replace("\n", nl)
         for m in reversed(blocks[1:]):  # a second copy would outlive --remove; keep exactly one
@@ -2743,16 +2870,90 @@ def install_instructions(target: str, remove: bool) -> str:
     return f"{f}: wiki-memory instructions {'removed' if remove else 'written'}"
 
 
-def install_omp(remove: bool) -> str:
-    f = HOME / ".omp/agent/extensions/wiki-memory.ts"
+ADAPTERS = {"omp": ("adapters/omp/wiki-memory.ts", HOME / ".omp/agent/extensions/wiki-memory.ts", "extension"),
+            "pi": ("adapters/pi/wiki-memory.ts", HOME / ".pi/agent/extensions/wiki-memory.ts", "extension"),
+            "opencode": ("adapters/opencode/wiki-memory.js", HOME / ".config/opencode/plugins/wiki-memory.js", "plugin")}
+
+
+def install_adapter(target: str, remove: bool) -> str:
+    """omp, Pi and OpenCode load code, not hook commands: copy the adapter with this CLI's path filled in."""
+    src, f, kind = ADAPTERS[target]
+    name = HARNESSES[target][0]
+    ours = f.exists() and "for wiki-memory. Installed by `wiki install" in f.read_text(errors="replace")
+    if f.exists() and not ours:
+        if remove:
+            return f"{name}: {f} is not this CLI's {kind}; left alone"
+        raise Usage(f"{f} exists and is not this CLI's {kind}; move it away first")
     if remove:
-        existed = f.exists()
         f.unlink(missing_ok=True)
-        return f"omp: {'removed ' + str(f) if existed else 'no extension installed'}"
+        return f"{name}: {'removed ' + str(f) if ours else f'no {kind} installed'}"
     f.parent.mkdir(parents=True, exist_ok=True)
-    src = (CODE / "adapters/omp/wiki-memory.ts").read_text()
-    f.write_text(src.replace("__WIKI_COMMAND__", json.dumps([sys.executable, str(CODE / "wiki.py")])[1:-1]))
-    return f"omp: extension written to {f} (new sessions load it)"
+    f.write_text((CODE / src).read_text().replace("__WIKI_COMMAND__", json.dumps([sys.executable, str(CODE / "wiki.py")])[1:-1]))
+    return f"{name}: {kind} written to {f} (new sessions load it)"
+
+
+# label, config folder under the home directory, binaries: a harness counts as present when either exists
+HARNESSES = {"claude-code": ("Claude Code", ".claude", ("claude",)), "codex": ("Codex", ".codex", ("codex",)),
+             "droid": ("Droid", ".factory", ("droid",)),
+             "opencode": ("OpenCode", ".config/opencode", ("opencode", "opencode2", "opencode-next")),
+             "pi": ("Pi", ".pi/agent", ("pi",)), "omp": ("omp", ".omp/agent", ("omp",)),
+             "agy": ("Antigravity", ".gemini/config", ("agy",))}
+
+
+def detect_harnesses() -> list[str]:
+    return [t for t, (_, folder, bins) in HARNESSES.items()
+            if (HOME / folder).is_dir() or any(shutil.which(b) for b in bins)]
+
+
+def hook_installed(target: str) -> bool:
+    """Does this harness load the wiki at session start? Unreadable configs count as no."""
+    try:
+        if target in ADAPTERS:
+            return ADAPTERS[target][1].exists()
+        if target == "claude-code":
+            return bool(claude_hooks(load_config(HOME / ".claude/settings.json")))
+        if target == "agy":
+            return AGY_KEY in load_config(HOME / ".gemini/config/hooks.json")
+        entries = session_hooks(target)[2].get("SessionStart", [])
+        return without_wiki_hooks(entries) != entries
+    except (Usage, OSError):
+        return False
+
+
+def other_memory_hook(target: str) -> str:
+    """claude-memory-hooks loads the per-project memory files and tells the agent to write them; with the
+    wiki installed too, an agent gets two memories and two sets of saving rules."""
+    try:
+        if target in ADAPTERS:
+            found = any(ADAPTERS[target][1].parent.glob("project-memory.*"))
+        elif target in ("droid", "codex"):
+            found = "memory-hook" in session_hook_file(target)[0].read_text(errors="replace")
+        elif target == "agy":
+            found = "claude-memory-hooks" in (HOME / ".gemini/config/hooks.json").read_text(errors="replace")
+        else:
+            found = False
+    except OSError:
+        found = False
+    return (f"  note: claude-memory-hooks also loads memory into {HARNESSES[target][0]}; keep one of the two "
+            f"(its `./install.sh --uninstall {target}` removes it)") if found else ""
+
+
+SKILL_DIRS = (HOME / ".agents/skills/wiki-memory", HOME / ".claude/skills/wiki-memory")
+
+
+def install_skill(remove: bool) -> str:
+    """The agent skill: how to set the wiki up, recall, save and maintain it. ~/.agents/skills is read by
+    Codex, OpenCode, Pi, omp and Droid; Claude Code reads ~/.claude/skills."""
+    done = []
+    for d in SKILL_DIRS:
+        if remove:
+            if (d / "SKILL.md").exists() and "name: wiki-memory" in (d / "SKILL.md").read_text(errors="replace"):
+                shutil.rmtree(d)
+                done.append(str(d))
+        elif d.parts[-3] == ".agents" or (HOME / ".claude").is_dir():
+            shutil.copytree(CODE / "skills/wiki-memory", d, dirs_exist_ok=True)
+            done.append(str(d))
+    return f"skill: {'removed' if remove else 'copied to'} {', '.join(done)}" if done else "skill: not installed"
 
 
 def install_bin(remove: bool) -> str:
@@ -2858,22 +3059,41 @@ def install_schedule(remove: bool, at: str) -> str:
             f"`journalctl --user -u {SYSTEMD_UNIT}` for output)")
 
 
+INSTALL_TARGETS = ("bin", *HARNESSES, "skill", "schedule")
+
+
 def cmd_install(args) -> int:
-    """Wire the CLI into this machine: the `wiki` command, an agent's session-start hook and its global
-    instructions, the nightly job."""
-    hooks = {"claude-code": install_claude, "omp": install_omp}
-    lines = []
-    for t in args.targets:
+    """Wire the CLI into this machine: the `wiki` command, each agent's session-start hook and global
+    instructions, the skill, the nightly job. With no target: the command, every agent found here and
+    the skill (--remove: every agent's hook and the skill)."""
+    bad = [t for t in args.targets if t not in INSTALL_TARGETS]
+    if bad:
+        raise Usage(f"unknown install target: {', '.join(bad)} (choose from {', '.join(INSTALL_TARGETS)})")
+    targets, lines = list(args.targets), []
+    if not targets:
+        found = detect_harnesses()
+        targets = [*HARNESSES, "skill"] if args.remove else ["bin", *found, "skill"]
+        if not found and not args.remove:
+            lines.append(f"no agent found ({', '.join(HARNESSES)}); name one to wire it anyway")
+    if args.dry_run:
+        lines.append(f"would {'remove' if args.remove else 'install'}: {', '.join(targets)}")
+        out(args, {"targets": targets, "done": lines}, "\n".join(lines))
+        return 0
+    for t in targets:
         if t == "bin":
             lines.append(install_bin(args.remove))
         elif t == "schedule":
             lines.append(install_schedule(args.remove, args.at))
+        elif t == "skill":
+            lines.append(install_skill(args.remove))
         else:
-            if t in hooks:
-                lines.append(hooks[t](args.remove))
-            if args.remove or not args.no_instructions:
+            lines.append(install_claude(args.remove) if t == "claude-code" else install_agy(args.remove) if t == "agy"
+                         else install_adapter(t, args.remove) if t in ADAPTERS else install_session_hook(t, args.remove))
+            if t in GLOBAL_FILES and (args.remove or not args.no_instructions):
                 lines.append(install_instructions(t, args.remove))
-    out(args, {"done": lines}, "\n".join(lines))
+            if not args.remove and other_memory_hook(t):
+                lines.append(other_memory_hook(t))
+    out(args, {"targets": targets, "done": lines}, "\n".join(lines))
     return 0
 
 
@@ -2995,14 +3215,9 @@ def cmd_doctor(args) -> int:
     link = shutil.which("wiki")
     check("wiki on PATH", bool(link) or None, link or "not on PATH; hooks call the script by its full path",
           "wiki.py install bin")
-    try:
-        settings = json.loads((HOME / ".claude/settings.json").read_text())
-    except (OSError, ValueError):
-        settings = {}
-    hooks = [n for n, on in (("Claude Code", bool(claude_hooks(settings))),
-                             ("omp", (HOME / ".omp/agent/extensions/wiki-memory.ts").exists())) if on]
+    hooks = [HARNESSES[t][0] for t in HARNESSES if hook_installed(t)]
     check("session hook", bool(hooks) or None, ", ".join(hooks) or "no agent loads the wiki yet",
-          "wiki install claude-code   (or: wiki install omp, wiki install codex)")
+          "wiki install   (every agent found on this machine), or name one: " + ", ".join(HARNESSES))
     blocks = [t for t, f in GLOBAL_FILES.items() if f.exists() and BLOCK[0] in f.read_text(errors="replace")]
     check("instructions", bool(blocks) or None, ", ".join(blocks) or "no global instructions file has the wiki block",
           "wiki install claude-code   (writes the hook and the block)")
@@ -3260,11 +3475,15 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--from-event", type=int, default=0)
     verb("doctor", cmd_doctor, "check the install: runner, sandbox, hooks, schedule, sync")
     s = verb("install", cmd_install, "wire the CLI into this machine")
-    s.add_argument("targets", nargs="+", choices=("bin", "claude-code", "omp", "codex", "schedule"))
+    s.add_argument("targets", nargs="*", metavar="target",
+                   help=f"{', '.join(INSTALL_TARGETS)}; none: bin, every agent found here and the skill")
     s.add_argument("--no-instructions", action="store_true",
                    help="only the hook: leave the agent's global instructions file alone")
     s.add_argument("--remove", action="store_true")
+    s.add_argument("--dry-run", action="store_true", help="print the targets and change nothing")
     s.add_argument("--at", default="04:30", help="schedule: HH:MM local time (default 04:30)")
+    s = verb("hook", cmd_hook, "the memory block in one agent's hook format (session-start hooks run this)")
+    s.add_argument("format", choices=HOOK_FORMATS)
     s = verb("config", cmd_config, "show settings, or write one to the env file")
     s.add_argument("action", nargs="?", choices=("set", "unset"))
     s.add_argument("key", nargs="?")

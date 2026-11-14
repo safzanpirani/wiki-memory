@@ -16,16 +16,41 @@ Claude Code's built-in memory stores one fact per file with an index per project
 
 A wiki has one page per subject. The page about a server holds everything known about it, and each project's hub page links to it. After importing those 1,583 files the wiki had 695 pages. The block a session loads for one project is 16,000 characters: a scoped index, the project hub and the few pages marked `core`.
 
+## Why Python
+
+`wiki` is one file, `wiki.py`, of about 3,500 lines that imports only the standard library. The install is a `git clone` and a symlink. There is no package manager step, no build and no binary to download for your platform, and the hooks call the script by its full path. You can read the whole program before you let it edit your agent configs.
+
+Most of what it does is text and git: parse frontmatter, follow `[[links]]`, run `git`, and start a headless agent in a sandbox. The model passes take minutes, so the language is not what you wait for.
+
+The cost is start-up time. A session-start hook takes about 0.3 seconds on a wiki of 700 pages, of which about 0.05 seconds is the interpreter starting. A compiled or Bun build would start faster. It would also need a runtime that fewer machines have, or a release for each platform. The adapters for omp, Pi and OpenCode are TypeScript because those agents load TypeScript.
+
 ## Quick start
 
 ```sh
-git clone https://github.com/safzanpirani/wiki-memory
-cd wiki-memory
-./install.sh claude-code      # links `wiki` into ~/.local/bin, creates the wiki, adds the session hook
-wiki doctor                   # shows what is wired and what is missing
+curl -fsSL https://raw.githubusercontent.com/safzanpirani/wiki-memory/main/install.sh | sh
 ```
 
-For omp, run `./install.sh omp`. For Codex or another agent, see [Other agents](#other-agents).
+The script clones this repository to `~/.local/share/wiki-memory/src`, links `wiki` into `~/.local/bin`, creates an empty wiki, and wires every agent it finds on the machine. It ends with `wiki doctor`, which shows what is wired and what is missing. Start a new agent session afterwards: hooks load when an agent starts.
+
+From a checkout, `./install.sh` does the same. `./install.sh --dry-run` lists what it would wire and changes nothing. `./install.sh claude-code codex` wires only the agents you name.
+
+| Agent | What the installer changes | When memory loads |
+|---|---|---|
+| Claude Code | a `SessionStart` hook in `~/.claude/settings.json` | session start, resume, clear, after compaction |
+| Codex | a `SessionStart` hook in `~/.codex/hooks.json` | session start |
+| Droid | a `SessionStart` hook in `~/.factory/hooks.json` if that file exists, otherwise in `~/.factory/settings.json` | session start |
+| OpenCode 1 and 2 | a plugin at `~/.config/opencode/plugins/wiki-memory.js` | version 1: the first message of a top-level session and after compaction. Version 2: the system prompt of every request |
+| Pi | an extension at `~/.pi/agent/extensions/wiki-memory.ts` | the first turn of a session and after compaction |
+| omp | an extension at `~/.omp/agent/extensions/wiki-memory.ts` | the first turn of a top-level session, after compaction, and after `/move` to another project |
+| Antigravity | a `PreInvocation` hook under the `wiki-memory` key in `~/.gemini/config/hooks.json` | the first model call of a conversation |
+
+Every edit to a JSON config leaves a `*.bak-wiki-memory-<timestamp>` copy beside it and keeps the other hooks in the file. Running the installer again changes nothing. `wiki install --remove` takes every hook and the skill out again.
+
+Codex runs hooks only with `hooks = true` under `[features]` in `~/.codex/config.toml`, and it asks you to trust a new hook the first time an interactive session sees it. For a run where the hook does not fire, the block in `~/.codex/AGENTS.md` tells Codex to load the memory itself.
+
+The installer also copies an agent skill to `~/.agents/skills/wiki-memory` and `~/.claude/skills/wiki-memory`. The skill tells an agent how to recall, save, check and repair the memory, and how to install it on a machine that lacks it. You can install the skill alone with `npx skills add safzanpirani/wiki-memory` and then ask the agent to set up wiki-memory.
+
+[claude-memory-hooks](https://github.com/safzanpirani/claude-memory-hooks) loads Claude Code's memory files into the same agents. Keep one of the two on each agent: with both installed, an agent gets two memories and two sets of saving rules. The installer prints a note when it finds the other one.
 
 If you already have Claude Code memory, import it:
 
@@ -164,7 +189,7 @@ Model passes run through a headless agent you already have. `wiki` picks the fir
 
 ## Other agents
 
-Any agent that can run a command at session start can use the wiki. For Codex, add this to `~/.codex/AGENTS.md`:
+An agent the installer does not know can still use the wiki when it can run a command at session start. `wiki hook text` reads `{"cwd": "<project folder>"}` on stdin and prints the memory block. It prints nothing and exits 0 when anything is wrong, so it never blocks a session. Without a hook, add this to the agent's instructions file:
 
 ```
 At the start of each session run `wiki context --instructions` and treat its output as your memory.
@@ -199,7 +224,8 @@ Every command takes `--json`. Exit codes: 0 ok, 1 failed, 2 usage, 3 lint issues
 | `status`, `doctor`, `lint [--fix]`, `verify` | no | state, install check, page checks, import fidelity |
 | `history`, `diff`, `undo` | no | git history per page; revert a pass |
 | `sync` | no | commit notes, pull, push |
-| `install bin\|claude-code\|omp\|schedule [--remove]` | no | wire the CLI into this machine |
+| `install [target...] [--remove] [--dry-run]` | no | wire the CLI into this machine; targets: `bin`, `claude-code`, `codex`, `droid`, `opencode`, `pi`, `omp`, `agy`, `skill`, `schedule` |
+| `hook droid\|codex\|agy\|text` | no | the memory block in one agent's hook format; session hooks run it |
 | `import`, `fold`, `dream`, `nightly` | yes | compile memory files; fold notes; read sessions; the scheduled pass |
 
 `wiki --help` and the top of `wiki.py` list every flag.
