@@ -44,6 +44,8 @@ wiki bootstrap                # one model run per project writes its first pages
 
 `wiki bootstrap` reads the newest 15 sessions of each project from the last 30 days (`--days`, `--max-sessions`, `--project`), skips excluded directories, and creates the two pages every session loads: a user profile and a working-style page. You can also skip it: with only the hook installed, pages appear as agents save notes.
 
+One measured run: a project with 6 sessions took 4 minutes through Claude Code on a Haiku-class model and wrote 8 pages. 1.3 million tokens went through the model (88% of them cached re-reads) and it wrote 49,000, which is between 5 and 25 US cents at list prices. A project with no sessions still gets the two seed pages and the three questions.
+
 Then schedule the unattended pass:
 
 ```sh

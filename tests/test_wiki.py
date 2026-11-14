@@ -705,6 +705,11 @@ class Public(Base):
         # no memory files: import says so and points at bootstrap
         self.assertIn("wiki bootstrap --dry-run", w("import", "--all").stdout)
         self.assertIn("No sessions found", w("bootstrap", "--dry-run").stdout)
+        # a real run with nothing to read still seeds the two pages (and would ask the questions on a TTY)
+        empty = {"WIKI_HOME": str(home / "wiki-empty")}
+        w("init", **empty)
+        res = json.loads(w("bootstrap", "--json", **empty).stdout)
+        self.assertEqual((res["seeded"], res["runs"]), (["user-profile", "feedback-working-style"], []))
         # two projects with sessions, one of them excluded
         shop, secret = "/srv/wm-test/shop", "/srv/wm-test/secret"  # temp dirs count as smoke sessions and are skipped
         (home / "exclude.txt").write_text(secret + "\n")
@@ -749,6 +754,12 @@ class Public(Base):
         w("config", "unset", "WIKI_NIGHTLY")
         self.assertEqual({r["key"]: r for r in json.loads(w("config", "--json").stdout)["settings"]}["WIKI_NIGHTLY"]["source"],
                          "default")
+        # a value the loader would strip (outer quotes) reads back as it was set
+        quoted = '"/opt/Agent Runner/agent" "{prompt}"'
+        w("config", "set", "WIKI_RUNNER_CMD", quoted)
+        self.assertEqual({r["key"]: r for r in json.loads(w("config", "--json").stdout)["settings"]}["WIKI_RUNNER_CMD"]["value"],
+                         quoted)
+        w("config", "unset", "WIKI_RUNNER_CMD")
 
         # instruction blocks: written once, replaced in place, removed without touching the user's own text
         md = home / ".claude/CLAUDE.md"
@@ -770,6 +781,17 @@ class Public(Base):
         self.assertEqual((home / ".codex/AGENTS.md").read_text(), "")
         w("install", "omp", "--no-instructions")
         self.assertFalse((home / ".omp/agent/AGENTS.md").exists())
+        # CRLF text around a block in the middle plus a stale second copy: one block after install,
+        # the user's bytes back after --remove
+        mine = "# Rules\r\n\r\nBe brief.\r\n\r\n## More\r\n\r\nNo emoji.\r\n"
+        stale = "<!-- wiki-memory:begin (managed by `wiki install`; edits here are overwritten) -->\r\nold\r\n<!-- wiki-memory:end -->\r\n"
+        md.write_bytes((mine[:24] + "\r\n" + stale + mine[24:] + "\r\n" + stale).encode())
+        w("install", "claude-code")
+        raw = md.read_bytes().decode()
+        self.assertEqual((raw.count("wiki-memory:begin"), raw.count("\n") - raw.count("\r\n"), "old" in raw), (1, 0, False))
+        self.assertTrue(raw.startswith(mine[:24]) and raw.endswith(mine[24:]))
+        w("install", "claude-code", "--remove")
+        self.assertEqual(md.read_bytes().decode(), mine)
 
     def test_runner_commands(self):
         code = ("from pathlib import Path\n"

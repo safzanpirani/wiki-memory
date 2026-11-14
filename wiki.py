@@ -2658,36 +2658,59 @@ def install_claude(remove: bool) -> str:
 
 BLOCK = ("<!-- wiki-memory:begin (managed by `wiki install`; edits here are overwritten) -->",
          "<!-- wiki-memory:end -->")
+BLOCK_RE = re.compile(re.escape(BLOCK[0]) + r".*?" + re.escape(BLOCK[1]) + r"(?:\r?\n)?", re.S)
 GLOBAL_FILES = {"claude-code": HOME / ".claude/CLAUDE.md", "omp": HOME / ".omp/agent/AGENTS.md",
                 "codex": HOME / ".codex/AGENTS.md"}
+
+
+def _drop_block(text: str, m: "re.Match") -> str:
+    """text without one managed block and without the blank line install put in front of it."""
+    head = text[:m.start()]
+    for sep in ("\r\n\r\n", "\n\n"):
+        if head.endswith(sep):
+            head = head[:-len(sep) // 2]
+            break
+    return head + text[m.end():]
 
 
 def install_instructions(target: str, remove: bool) -> str:
     """A marked block in the agent's global instructions file: when to recall, when and how to save.
     The session hook loads the memory itself; this keeps the habit alive deep into a long session and
-    in subagents the hook does not reach. Codex has no session hook, so its block also loads the memory."""
+    in subagents the hook does not reach. Codex has no session hook, so its block also loads the memory.
+    Only the managed spans change: the user's own text and its line endings stay byte for byte."""
     f = GLOBAL_FILES[target]
-    text = f.read_text() if f.exists() else ""
-    start, end = text.find(BLOCK[0]), text.find(BLOCK[1])
-    has = 0 <= start < end
-    rest = (text[:start].rstrip("\n") + "\n" + text[end + len(BLOCK[1]):].lstrip("\n")) if has else text
+    text = ""
+    if f.exists():
+        with f.open(newline="") as fh:
+            text = fh.read()
+    blocks = list(BLOCK_RE.finditer(text))
+    new = text
     if remove:
-        if not has:
+        if not blocks:
             return f"{f}: no wiki-memory block"
-        new = rest.strip("\n") + "\n" if rest.strip() else ""
+        for m in reversed(blocks):
+            new = _drop_block(new, m)
     else:
         body = (CODE / "prompts/global.md").read_text().strip()
         if target == "codex":
             body += ("\n- **At the start of every session** run `wiki context --instructions` and treat its output as "
                      "your memory for this project.")
-        new = (rest.rstrip("\n") + "\n\n" if rest.strip() else "") + f"{BLOCK[0]}\n{body}\n{BLOCK[1]}\n"
+        nl = "\r\n" if "\r\n" in text else "\n"
+        block = f"{BLOCK[0]}\n{body}\n{BLOCK[1]}\n".replace("\n", nl)
+        for m in reversed(blocks[1:]):  # a second copy would outlive --remove; keep exactly one
+            new = _drop_block(new, m)
+        if blocks:
+            new = new[:blocks[0].start()] + block + new[blocks[0].end():]
+        else:
+            new += ("" if not text or text.endswith("\n") else nl) + (nl if text.strip() else "") + block
     if new == text:
         return f"{f}: instructions already current"
     if f.exists():
         shutil.copy2(f, f.with_name(f"{f.name}.bak-wiki-memory-{datetime.now():%Y%m%d-%H%M%S}"))
     f.parent.mkdir(parents=True, exist_ok=True)
     tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
-    tmp.write_text(new)
+    with tmp.open("w", newline="") as fh:
+        fh.write(new)
     if f.exists():
         os.chmod(tmp, f.stat().st_mode & 0o777)
     tmp.replace(f)
@@ -2862,7 +2885,10 @@ def cmd_config(args) -> int:
         lines = env_file.read_text().splitlines() if env_file.exists() else []
         lines = [line for line in lines if line.strip().partition("=")[0].strip() != args.key]
         if args.action == "set":
-            lines.append(f"{args.key}={args.value}")
+            value = args.value  # the loader strips blanks and one outer quote pair; wrap what that would change
+            if value != value.strip() or (len(value) >= 2 and value[0] == value[-1] and value[0] in "'\""):
+                value = f'"{value}"'
+            lines.append(f"{args.key}={value}")
         env_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = env_file.with_name(f".env.{os.getpid()}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -3078,21 +3104,27 @@ def cmd_bootstrap(args) -> int:
         want = resolve_cwd(args.project)
         by_cwd = {c: v for c, v in by_cwd.items() if c == want}
     plan = sorted(({"cwd": c, "sessions": sorted(v, key=lambda x: -x["mtime"])[:args.max_sessions], "found": len(v)}
-                   for c, v in by_cwd.items()), key=lambda b: -b["found"])[:args.max_projects]
+                   for c, v in by_cwd.items()), key=lambda b: -b["found"])
+    more, plan = max(0, len(plan) - args.max_projects), plan[:args.max_projects]
     kb = sum(x["kb"] for b in plan for x in b["sessions"])
     head = (f"{len(plan)} projects with agent sessions in the last {args.days} days; "
             f"{sum(len(b['sessions']) for b in plan)} sessions ({kb / 1024:.1f} MB of transcripts) would be read, "
-            f"one model run per project, newest {args.max_sessions} sessions each")
+            f"one model run per project, newest {args.max_sessions} sessions each"
+            + (f"; {more} less active projects left out (--max-projects)" if more else ""))
     rows = [f"  {len(b['sessions']):>3} of {b['found']:<4} {b['cwd']}" for b in plan]
-    if args.dry_run or not plan:
-        hint = ("\nNo sessions found: start using the hook and `wiki note`; pages appear with the first `wiki fold`."
-                if not plan else "\nA run reads the dialogue only, in bounded slices, so it costs far less than the transcript "
-                "sizes suggest; there is no measured estimate yet. Run without --dry-run to start, or try one project "
+    none = "\nNo sessions found: start using the hook and `wiki note`; pages appear with the first `wiki fold`."
+    if args.dry_run:
+        hint = (none if not plan else "\nA run reads the dialogue only, in bounded slices, so it costs far less than the "
+                "transcript sizes suggest: one measured project (6 sessions, a Haiku-class model) took 4 minutes and "
+                "1.3 million tokens, 88% of them cached re-reads. Run without --dry-run to start, or try one project "
                 "first with --project.")
         out(args, {"plan": [{"cwd": b["cwd"], "sessions": len(b["sessions"]), "found": b["found"]} for b in plan],
                    "transcriptKB": kb}, "\n".join([head, *rows]) + hint)
         return 0
-    model_host_check()
+    if plan:
+        model_host_check()
+    else:  # nothing to read: the seed pages and the questions still give the first sessions something
+        print(none.strip(), file=sys.stderr)
     with Lock():
         seeded = seed_pages()
         if seeded:
